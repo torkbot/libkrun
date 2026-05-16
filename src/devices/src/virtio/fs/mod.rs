@@ -26,7 +26,11 @@ use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
-pub use self::filesystem::ExportTable;
+pub use self::filesystem::{
+    Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
+    ListxattrReply, OpenOptions, RemovemappingOne, SecContext, SetattrValid, ZeroCopyReader,
+    ZeroCopyWriter,
+};
 
 mod defs {
     use super::super::QueueConfig;
