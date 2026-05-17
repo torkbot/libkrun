@@ -39,6 +39,43 @@ pub trait VirtualFsBackend: Send + Sync + 'static {
         let _ = (inode, size);
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
+
+    fn mkdir(&self, parent: u64, name: &CStr, mode: u32) -> io::Result<Entry> {
+        let _ = (parent, name, mode);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn unlink(&self, parent: u64, name: &CStr) -> io::Result<()> {
+        let _ = (parent, name);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn rmdir(&self, parent: u64, name: &CStr) -> io::Result<()> {
+        let _ = (parent, name);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn rename(
+        &self,
+        olddir: u64,
+        oldname: &CStr,
+        newdir: u64,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let _ = (olddir, oldname, newdir, newname, flags);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn symlink(&self, linkname: &CStr, parent: u64, name: &CStr) -> io::Result<Entry> {
+        let _ = (linkname, parent, name);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn readlink(&self, inode: u64) -> io::Result<Vec<u8>> {
+        let _ = inode;
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
 }
 
 #[derive(Clone)]
@@ -224,5 +261,52 @@ impl FileSystem for VirtualFs {
 
     fn access(&self, _ctx: Context, _inode: Self::Inode, _mask: u32) -> io::Result<()> {
         Ok(())
+    }
+
+    fn mkdir(
+        &self,
+        _ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        _umask: u32,
+        _extensions: super::filesystem::Extensions,
+    ) -> io::Result<Entry> {
+        self.backend.mkdir(parent, name, mode)
+    }
+
+    fn unlink(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        self.backend.unlink(parent, name)
+    }
+
+    fn rmdir(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        self.backend.rmdir(parent, name)
+    }
+
+    fn rename(
+        &self,
+        _ctx: Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.backend.rename(olddir, oldname, newdir, newname, flags)
+    }
+
+    fn symlink(
+        &self,
+        _ctx: Context,
+        linkname: &CStr,
+        parent: Self::Inode,
+        name: &CStr,
+        _extensions: super::filesystem::Extensions,
+    ) -> io::Result<Entry> {
+        self.backend.symlink(linkname, parent, name)
+    }
+
+    fn readlink(&self, _ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+        self.backend.readlink(inode)
     }
 }
