@@ -2213,6 +2213,35 @@ unsafe fn load_krunfw_payload(
     Ok(())
 }
 
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_kernel_bundle_raw(
+    ctx_id: u32,
+    host_addr: u64,
+    guest_addr: u64,
+    entry_addr: u64,
+    size: usize,
+) -> i32 {
+    let kernel_bundle = KernelBundle {
+        host_addr,
+        guest_addr,
+        entry_addr,
+        size,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => match ctx_cfg.get_mut().vmr.set_kernel_bundle(kernel_bundle)
+        {
+            Ok(()) => KRUN_SUCCESS,
+            Err(error) => {
+                error!("Invalid kernel bundle: {error}");
+                -libc::EINVAL
+            }
+        },
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
