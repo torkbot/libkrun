@@ -19,11 +19,21 @@ use super::descriptor_utils::{Reader, Writer};
 use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
+use super::virtual_fs::VirtualFs;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
+
+pub enum FsBackend {
+    Passthrough {
+        config: passthrough::Config,
+        read_only: bool,
+    },
+    Virtual(VirtualFs),
+}
 
 enum FsServer {
     ReadWrite(Server<PassthroughFs>),
     ReadOnly(Server<PassthroughFsRo>),
+    Virtual(Server<VirtualFs>),
 }
 
 impl FsServer {
@@ -45,6 +55,14 @@ impl FsServer {
                 map_sender,
             ),
             FsServer::ReadOnly(s) => s.handle_message(
+                r,
+                w,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
+            FsServer::Virtual(s) => s.handle_message(
                 r,
                 w,
                 shm_region,
@@ -77,16 +95,19 @@ impl FsWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         shm_region: Option<VirtioShmRegion>,
-        passthrough_cfg: passthrough::Config,
-        read_only: bool,
+        backend: FsBackend,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
-        let server = if read_only {
-            FsServer::ReadOnly(Server::new(PassthroughFsRo::new(passthrough_cfg)?))
-        } else {
-            FsServer::ReadWrite(Server::new(PassthroughFs::new(passthrough_cfg)?))
+        let server = match backend {
+            FsBackend::Passthrough { config, read_only } if read_only => {
+                FsServer::ReadOnly(Server::new(PassthroughFsRo::new(config)?))
+            }
+            FsBackend::Passthrough { config, .. } => {
+                FsServer::ReadWrite(Server::new(PassthroughFs::new(config)?))
+            }
+            FsBackend::Virtual(fs) => FsServer::Virtual(Server::new(fs)),
         };
         Ok(Self {
             queues,

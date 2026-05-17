@@ -17,7 +17,8 @@ use super::super::{
     VirtioShmRegion,
 };
 use super::passthrough;
-use super::worker::FsWorker;
+use super::virtual_fs::{VirtualFs, VirtualFsBackend};
+use super::worker::{FsBackend, FsWorker};
 use super::ExportTable;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -46,13 +47,32 @@ pub struct Fs {
     device_state: DeviceState,
     config: VirtioFsConfig,
     shm_region: Option<VirtioShmRegion>,
-    passthrough_cfg: passthrough::Config,
-    read_only: bool,
+    backend: DeviceFsBackend,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
+}
+
+enum DeviceFsBackend {
+    Passthrough {
+        config: passthrough::Config,
+        read_only: bool,
+    },
+    Virtual(VirtualFs),
+}
+
+impl DeviceFsBackend {
+    fn worker_backend(&self) -> FsBackend {
+        match self {
+            DeviceFsBackend::Passthrough { config, read_only } => FsBackend::Passthrough {
+                config: config.clone(),
+                read_only: *read_only,
+            },
+            DeviceFsBackend::Virtual(fs) => FsBackend::Virtual(fs.clone()),
+        }
+    }
 }
 
 impl Fs {
@@ -63,8 +83,6 @@ impl Fs {
         allow_root_dir_delete: bool,
         read_only: bool,
     ) -> super::Result<Fs> {
-        let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
-
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
@@ -76,14 +94,47 @@ impl Fs {
             ..Default::default()
         };
 
+        Self::from_backend(
+            config,
+            DeviceFsBackend::Passthrough {
+                config: fs_cfg,
+                read_only,
+            },
+            exit_code,
+        )
+    }
+
+    pub fn new_virtual(
+        fs_id: String,
+        backend: Arc<dyn VirtualFsBackend>,
+        exit_code: Arc<AtomicI32>,
+    ) -> super::Result<Fs> {
+        let tag = fs_id.into_bytes();
+        let mut config = VirtioFsConfig::default();
+        config.tag[..tag.len()].copy_from_slice(tag.as_slice());
+        config.num_request_queues = 1;
+
+        Self::from_backend(
+            config,
+            DeviceFsBackend::Virtual(VirtualFs::new(backend)),
+            exit_code,
+        )
+    }
+
+    fn from_backend(
+        config: VirtioFsConfig,
+        backend: DeviceFsBackend,
+        exit_code: Arc<AtomicI32>,
+    ) -> super::Result<Fs> {
+        let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+
         Ok(Fs {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
             shm_region: None,
-            passthrough_cfg: fs_cfg,
-            read_only,
+            backend,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -103,10 +154,14 @@ impl Fs {
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
         static FS_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
-        self.passthrough_cfg.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-        self.passthrough_cfg.export_table = Some(export_table);
-
-        self.passthrough_cfg.export_fsid
+        match &mut self.backend {
+            DeviceFsBackend::Passthrough { config, .. } => {
+                config.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+                config.export_table = Some(export_table);
+                config.export_fsid
+            }
+            DeviceFsBackend::Virtual(_) => 0,
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -186,8 +241,7 @@ impl VirtioDevice for Fs {
             interrupt.clone(),
             mem.clone(),
             self.shm_region.clone(),
-            self.passthrough_cfg.clone(),
-            self.read_only,
+            self.backend.worker_backend(),
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
             #[cfg(target_os = "macos")]

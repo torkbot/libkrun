@@ -6,6 +6,7 @@ pub mod fuse;
 mod multikey;
 mod read_only;
 mod server;
+mod virtual_fs;
 mod worker;
 
 #[cfg(target_os = "linux")]
@@ -31,6 +32,7 @@ pub use self::filesystem::{
     ListxattrReply, OpenOptions, RemovemappingOne, SecContext, SetattrValid, ZeroCopyReader,
     ZeroCopyWriter,
 };
+pub use self::virtual_fs::{VirtualDirEntry, VirtualFs, VirtualFsBackend};
 
 mod defs {
     use super::super::QueueConfig;

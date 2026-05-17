@@ -4,6 +4,8 @@ extern crate log;
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
+#[cfg(not(feature = "tee"))]
+use devices::virtio::fs::VirtualFsBackend;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
@@ -36,7 +38,7 @@ use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use utils::eventfd::EventFd;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
@@ -49,7 +51,7 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(feature = "tee"))]
-use vmm::vmm_config::fs::FsDeviceConfig;
+use vmm::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig};
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
@@ -354,7 +356,13 @@ impl TryFrom<ContextConfig> for NitroEnclave {
         };
 
         let rootfs = if let Some(path) = &ctx.vmr.fs.first() {
-            path.shared_dir.clone()
+            match &path.backend {
+                FsDeviceBackend::Passthrough { shared_dir, .. } => shared_dir.clone(),
+                FsDeviceBackend::Virtual { .. } => {
+                    error!("virtual rootfs is not supported for nitro enclaves");
+                    return Err(-libc::EINVAL);
+                }
+            }
         } else {
             error!("rootfs path required");
             return Err(-libc::EINVAL);
@@ -594,11 +602,13 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
             let cfg = ctx_cfg.get_mut();
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id,
-                shared_dir,
+                backend: FsDeviceBackend::Passthrough {
+                    shared_dir,
+                    allow_root_dir_delete: false,
+                    read_only: false,
+                },
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
-                allow_root_dir_delete: false,
-                read_only: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -667,10 +677,34 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
             let cfg = ctx_cfg.get_mut();
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id: tag.to_string(),
-                shared_dir: path.to_string(),
+                backend: FsDeviceBackend::Passthrough {
+                    shared_dir: path.to_string(),
+                    allow_root_dir_delete: false,
+                    read_only,
+                },
                 shm_size: shm,
-                allow_root_dir_delete: false,
-                read_only,
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[cfg(not(feature = "tee"))]
+pub fn krun_add_virtual_virtiofs(
+    ctx_id: u32,
+    tag: String,
+    backend: Arc<dyn VirtualFsBackend>,
+    shm_size: Option<usize>,
+) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id: tag,
+                backend: FsDeviceBackend::Virtual { backend },
+                shm_size,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2349,14 +2383,15 @@ pub unsafe extern "C" fn krun_set_kernel_bundle_raw(
     };
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => match ctx_cfg.get_mut().vmr.set_kernel_bundle(kernel_bundle)
-        {
-            Ok(()) => KRUN_SUCCESS,
-            Err(error) => {
-                error!("Invalid kernel bundle: {error}");
-                -libc::EINVAL
+        Entry::Occupied(mut ctx_cfg) => {
+            match ctx_cfg.get_mut().vmr.set_kernel_bundle(kernel_bundle) {
+                Ok(()) => KRUN_SUCCESS,
+                Err(error) => {
+                    error!("Invalid kernel bundle: {error}");
+                    -libc::EINVAL
+                }
             }
-        },
+        }
         Entry::Vacant(_) => -libc::ENOENT,
     }
 }
@@ -2462,11 +2497,13 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
 
             ctx_cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id: "/dev/root".into(),
-                shared_dir: empty_root.to_string_lossy().into(),
+                backend: FsDeviceBackend::Passthrough {
+                    shared_dir: empty_root.to_string_lossy().into(),
+                    allow_root_dir_delete: true,
+                    read_only: false,
+                },
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
-                allow_root_dir_delete: true,
-                read_only: false,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);
