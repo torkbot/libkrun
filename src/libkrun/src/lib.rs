@@ -10,6 +10,7 @@ use devices::virtio::gpu::display::DisplayInfo;
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
+use devices::virtio::UnixIpcPort;
 use env_logger::{Env, Target};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -159,7 +160,7 @@ struct ContextConfig {
     block_root: Option<BlockRootConfig>,
     #[cfg(feature = "tee")]
     tee_config_file: Option<PathBuf>,
-    unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    unix_ipc_port_map: Option<HashMap<u32, UnixIpcPort>>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
@@ -308,12 +309,12 @@ impl ContextConfig {
         self.tee_config_file.clone()
     }
 
-    fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
+    fn add_vsock_port(&mut self, port: u32, ipc_port: UnixIpcPort) {
         if let Some(ref mut map) = &mut self.unix_ipc_port_map {
-            map.insert(port, (filepath, listen));
+            map.insert(port, ipc_port);
         } else {
-            let mut map: HashMap<u32, (PathBuf, bool)> = HashMap::new();
-            map.insert(port, (filepath, listen));
+            let mut map: HashMap<u32, UnixIpcPort> = HashMap::new();
+            map.insert(port, ipc_port);
             self.unix_ipc_port_map = Some(map);
         }
     }
@@ -1470,7 +1471,33 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
             }
-            cfg.add_vsock_port(port, filepath, listen);
+            cfg.add_vsock_port(
+                port,
+                UnixIpcPort::Path {
+                    path: filepath,
+                    listen,
+                },
+            );
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn krun_add_vsock_port_fd(ctx_id: u32, port: u32, fd: RawFd) -> i32 {
+    if fd < 0 {
+        return -libc::EINVAL;
+    }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            if cfg.vsock_config == VsockConfig::Disabled {
+                return -libc::ENODEV;
+            }
+            cfg.add_vsock_port(port, UnixIpcPort::ListenerFd(fd));
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
