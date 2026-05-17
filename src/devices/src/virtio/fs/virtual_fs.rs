@@ -41,7 +41,7 @@ impl FileSystem for VirtualFs {
     type Handle = u64;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        Ok(capable & FsOptions::DO_READDIRPLUS)
+        Ok(capable & FsOptions::empty())
     }
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
@@ -83,6 +83,19 @@ impl FileSystem for VirtualFs {
         Ok(data.len())
     }
 
+    fn release(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _flags: u32,
+        _handle: Self::Handle,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     fn opendir(
         &self,
         _ctx: Context,
@@ -118,6 +131,20 @@ impl FileSystem for VirtualFs {
             })?;
         }
 
+        Ok(())
+    }
+
+    fn releasedir(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _flags: u32,
+        _handle: Self::Handle,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn access(&self, _ctx: Context, _inode: Self::Inode, _mask: u32) -> io::Result<()> {
         Ok(())
     }
 }
