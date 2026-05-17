@@ -3,10 +3,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use devices::virtio::{TsiFlags, Vsock, VsockError};
+use devices::virtio::{TsiFlags, UnixIpcPort, Vsock, VsockError};
 
 type MutexVsock = Arc<Mutex<Vsock>>;
 
@@ -39,7 +38,7 @@ pub struct VsockDeviceConfig {
     /// An optional map of host to guest port mappings.
     pub host_port_map: Option<HashMap<u16, u16>>,
     /// An optional map of guest port to host UNIX domain sockets for IPC.
-    pub unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    pub unix_ipc_port_map: Option<HashMap<u32, UnixIpcPort>>,
     /// TSI feature flags
     pub tsi_flags: TsiFlags,
 }

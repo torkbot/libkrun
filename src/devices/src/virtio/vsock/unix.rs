@@ -27,6 +27,12 @@ use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnixIpcPort {
+    Path { path: PathBuf, listen: bool },
+    ListenerFd(RawFd),
+}
+
 pub struct UnixProxy {
     id: u64,
     cid: u64,
@@ -641,6 +647,15 @@ impl UnixAcceptorProxy {
         .map_err(ProxyError::CreatingSocket)?;
         listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
             .map_err(ProxyError::CreatingSocket)?;
+        Ok(UnixAcceptorProxy { id, fd, peer_port })
+    }
+
+    pub fn from_listener_fd(id: u64, fd: RawFd, peer_port: u32) -> Result<Self, ProxyError> {
+        let fd = unsafe { libc::dup(fd) };
+        if fd < 0 {
+            return Err(ProxyError::CreatingSocket(Errno::last()));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(UnixAcceptorProxy { id, fd, peer_port })
     }
 }

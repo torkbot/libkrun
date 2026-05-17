@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
@@ -17,7 +16,7 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
-use super::unix::UnixProxy;
+use super::unix::{UnixIpcPort, UnixProxy};
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
@@ -106,7 +105,7 @@ pub struct VsockMuxer {
     interrupt: Option<InterruptTransport>,
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
-    unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    unix_ipc_port_map: Option<HashMap<u32, UnixIpcPort>>,
     tsi_flags: TsiFlags,
 }
 
@@ -114,7 +113,7 @@ impl VsockMuxer {
     pub(crate) fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
-        unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        unix_ipc_port_map: Option<HashMap<u32, UnixIpcPort>>,
         tsi_flags: TsiFlags,
     ) -> Self {
         VsockMuxer {
@@ -545,41 +544,47 @@ impl VsockMuxer {
             if let Some(update) = proxy.lock().unwrap().confirm_connect(pkt) {
                 self.process_proxy_update(id, update);
             }
-        } else if let Some(ipc_map) = &mut self.unix_ipc_port_map
-            && let Some((path, listen)) = ipc_map.get(&pkt.dst_port())
-        {
-            let mem = self.mem.as_ref().unwrap();
-            let queue = self.queue.as_ref().unwrap();
-            if *listen {
-                warn!("Attempting to connect a socket that is listening, sending rst");
-                let rx = MuxerRx::Reset {
-                    local_port: pkt.dst_port(),
-                    peer_port: pkt.src_port(),
+        } else if let Some(ref mut ipc_map) = &mut self.unix_ipc_port_map {
+            if let Some(ipc_port) = ipc_map.get(&pkt.dst_port()) {
+                let mem = self.mem.as_ref().unwrap();
+                let queue = self.queue.as_ref().unwrap();
+                let path = match ipc_port {
+                    UnixIpcPort::Path {
+                        path,
+                        listen: false,
+                    } => path,
+                    UnixIpcPort::Path { listen: true, .. } | UnixIpcPort::ListenerFd(_) => {
+                        warn!("Attempting to connect a socket that is listening, sending rst");
+                        let rx = MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        };
+                        push_packet(self.cid, rx, &self.rxq, queue, mem);
+                        return;
+                    }
                 };
-                push_packet(self.cid, rx, &self.rxq, queue, mem);
-                return;
-            }
-            let rxq = self.rxq.clone();
+                let rxq = self.rxq.clone();
 
-            let mut unix = UnixProxy::new(
-                id,
-                self.cid,
-                pkt.dst_port(),
-                pkt.src_port(),
-                mem.clone(),
-                queue.clone(),
-                rxq,
-                path.to_path_buf(),
-            )
-            .unwrap();
-            let tsi = TsiConnectReq {
-                peer_port: 0,
-                addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
-            };
-            let update = unix.connect(pkt, tsi);
-            unix.confirm_connect(pkt);
-            proxy_map.insert(id, Mutex::new(Box::new(unix)));
-            self.process_proxy_update(id, update);
+                let mut unix = UnixProxy::new(
+                    id,
+                    self.cid,
+                    pkt.dst_port(),
+                    pkt.src_port(),
+                    mem.clone(),
+                    queue.clone(),
+                    rxq,
+                    path.to_path_buf(),
+                )
+                .unwrap();
+                let tsi = TsiConnectReq {
+                    peer_port: 0,
+                    addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
+                };
+                let update = unix.connect(pkt, tsi);
+                unix.confirm_connect(pkt);
+                proxy_map.insert(id, Mutex::new(Box::new(unix)));
+                self.process_proxy_update(id, update);
+            }
         }
     }
 

@@ -6,7 +6,6 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
@@ -21,6 +20,7 @@ use super::TsiFlags;
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::{defs, defs::uapi};
+use super::{TsiFlags, UnixIpcPort};
 use crate::virtio::InterruptTransport;
 
 pub(crate) const RXQ_INDEX: usize = 0;
@@ -53,7 +53,7 @@ impl Vsock {
     pub fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
-        unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        unix_ipc_port_map: Option<HashMap<u32, UnixIpcPort>>,
         tsi_flags: TsiFlags,
     ) -> super::Result<Vsock> {
         Ok(Vsock {

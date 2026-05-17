@@ -23,6 +23,7 @@ mod unix;
 pub use self::defs::TsiFlags;
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::Vsock;
+pub use self::unix::UnixIpcPort;
 
 use bitflags::bitflags;
 use vm_memory::GuestMemoryError;

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -12,7 +11,7 @@ use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
 use crate::virtio::vsock::defs;
-use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
+use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixIpcPort, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -27,7 +26,7 @@ pub struct MuxerThread {
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
-    unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    unix_ipc_port_map: HashMap<u32, UnixIpcPort>,
 }
 
 impl MuxerThread {
@@ -41,7 +40,7 @@ impl MuxerThread {
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
-        unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        unix_ipc_port_map: HashMap<u32, UnixIpcPort>,
     ) -> Self {
         MuxerThread {
             cid,
@@ -150,15 +149,17 @@ impl MuxerThread {
     }
 
     fn create_lisening_ipc_sockets(&self) {
-        for (port, (path, do_listen)) in &self.unix_ipc_port_map {
-            if !do_listen {
-                continue;
-            }
+        for (port, ipc_port) in &self.unix_ipc_port_map {
             let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            let proxy = match UnixAcceptorProxy::new(id, path, *port) {
+            let proxy = match ipc_port {
+                UnixIpcPort::Path { path, listen: true } => UnixAcceptorProxy::new(id, path, *port),
+                UnixIpcPort::ListenerFd(fd) => UnixAcceptorProxy::from_listener_fd(id, *fd, *port),
+                UnixIpcPort::Path { listen: false, .. } => continue,
+            };
+            let proxy = match proxy {
                 Ok(proxy) => proxy,
                 Err(e) => {
-                    warn!("Failed to create listening proxy at {path:?}: {e:?}");
+                    warn!("Failed to create listening proxy for port {port}: {e:?}");
                     continue;
                 }
             };
