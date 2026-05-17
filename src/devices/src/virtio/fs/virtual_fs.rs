@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use super::bindings;
 use super::filesystem::{
-    Context, DirEntry, Entry, FileSystem, FsOptions, OpenOptions, ZeroCopyWriter,
+    Context, DirEntry, Entry, FileSystem, FsOptions, OpenOptions, SetattrValid, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,21 @@ pub trait VirtualFsBackend: Send + Sync + 'static {
     fn readdir(&self, inode: u64) -> io::Result<Vec<VirtualDirEntry>>;
 
     fn read(&self, inode: u64, offset: u64, size: u32) -> io::Result<Vec<u8>>;
+
+    fn create(&self, parent: u64, name: &CStr, mode: u32) -> io::Result<Entry> {
+        let _ = (parent, name, mode);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn write(&self, inode: u64, offset: u64, data: &[u8]) -> io::Result<usize> {
+        let _ = (inode, offset, data);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn truncate(&self, inode: u64, size: u64) -> io::Result<(bindings::stat64, Duration)> {
+        let _ = (inode, size);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
 }
 
 #[derive(Clone)]
@@ -67,6 +83,50 @@ impl FileSystem for VirtualFs {
         Ok((Some(inode), OpenOptions::empty()))
     }
 
+    fn setattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        attr: bindings::stat64,
+        _handle: Option<Self::Handle>,
+        valid: SetattrValid,
+    ) -> io::Result<(bindings::stat64, Duration)> {
+        if valid.contains(SetattrValid::SIZE) {
+            return self.backend.truncate(inode, attr.st_size as u64);
+        }
+
+        self.backend.getattr(inode)
+    }
+
+    fn create(
+        &self,
+        _ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        _kill_priv: bool,
+        _flags: u32,
+        _umask: u32,
+        _extensions: super::filesystem::Extensions,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        let entry = self.backend.create(parent, name, mode)?;
+        let inode = entry.inode;
+        Ok((entry, Some(inode), OpenOptions::empty()))
+    }
+
+    fn mknod(
+        &self,
+        _ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        _umask: u32,
+        _extensions: super::filesystem::Extensions,
+    ) -> io::Result<Entry> {
+        self.backend.create(parent, name, mode)
+    }
+
     fn read<W: io::Write + ZeroCopyWriter>(
         &self,
         _ctx: Context,
@@ -81,6 +141,24 @@ impl FileSystem for VirtualFs {
         let data = self.backend.read(inode, offset, size)?;
         w.write_all(&data)?;
         Ok(data.len())
+    }
+
+    fn write<R: io::Read + ZeroCopyReader>(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        mut r: R,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        let mut data = vec![0; size as usize];
+        r.read_exact(&mut data)?;
+        self.backend.write(inode, offset, &data)
     }
 
     fn release(
