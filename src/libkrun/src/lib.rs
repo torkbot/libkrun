@@ -188,6 +188,7 @@ struct ContextConfig {
     exec_path: Option<String>,
     env: Option<String>,
     args: Option<String>,
+    direct_cmdline_prolog: Option<String>,
     rlimits: Option<String>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
@@ -274,6 +275,10 @@ impl ContextConfig {
             Some(env) => env.clone(),
             None => "".to_string(),
         }
+    }
+
+    fn set_direct_cmdline_prolog(&mut self, prolog: String) {
+        self.direct_cmdline_prolog = Some(prolog);
     }
 
     fn set_args(&mut self, args: String) {
@@ -2407,6 +2412,32 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
     }
 }
 
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub fn krun_set_direct_block_root(
+    ctx_id: u32,
+    device: String,
+    fstype: String,
+    options: String,
+    init_path: String,
+) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let ctx_cfg = ctx_cfg.get_mut();
+            if ctx_cfg.block_cfgs.is_empty() {
+                error!("No block devices configured");
+                return -libc::EINVAL;
+            }
+
+            ctx_cfg.set_direct_cmdline_prolog(format!(
+                "reboot=k panic=-1 panic_print=0 console=hvc0 root={device} rootfstype={fstype} {options} quiet no-kvmapf init={init_path}"
+            ));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[unsafe(no_mangle)]
 #[cfg(all(
     feature = "init-blob",
@@ -3021,7 +3052,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     let kernel_cmdline = KernelCmdlineConfig {
-        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+        prolog: Some(
+            ctx_cfg
+                .direct_cmdline_prolog
+                .clone()
+                .unwrap_or_else(|| format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+        ),
         krun_env: Some(format!(
             " {} {} {} {} {}",
             ctx_cfg.get_exec_path(),
