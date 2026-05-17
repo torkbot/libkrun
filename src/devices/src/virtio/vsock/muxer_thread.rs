@@ -154,6 +154,7 @@ impl MuxerThread {
             let proxy = match ipc_port {
                 UnixIpcPort::Path { path, listen: true } => UnixAcceptorProxy::new(id, path, *port),
                 UnixIpcPort::ListenerFd(fd) => UnixAcceptorProxy::from_listener_fd(id, *fd, *port),
+                UnixIpcPort::ConnectedFd(_) => continue,
                 UnixIpcPort::Path { listen: false, .. } => continue,
             };
             let proxy = match proxy {

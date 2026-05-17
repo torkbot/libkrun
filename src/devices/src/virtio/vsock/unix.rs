@@ -30,6 +30,7 @@ use vm_memory::GuestMemoryMmap;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnixIpcPort {
     Path { path: PathBuf, listen: bool },
+    ConnectedFd(RawFd),
     ListenerFd(RawFd),
 }
 
@@ -159,6 +160,28 @@ impl UnixProxy {
             push_cnt: Wrapping(0),
             path: Default::default(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_connected_fd(
+        id: u64,
+        cid: u64,
+        local_port: u32,
+        control_port: u32,
+        fd: RawFd,
+        mem: GuestMemoryMmap,
+        queue: Arc<Mutex<VirtQueue>>,
+        rxq: Arc<Mutex<MuxerRxQ>>,
+    ) -> Result<Self, ProxyError> {
+        let fd = unsafe { libc::dup(fd) };
+        if fd < 0 {
+            return Err(ProxyError::CreatingSocket(Errno::last()));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut proxy =
+            UnixProxy::new_reverse(id, cid, local_port, control_port, fd, mem, queue, rxq);
+        proxy.switch_to_connected();
+        Ok(proxy)
     }
 
     fn switch_to_connected(&mut self) {
@@ -328,6 +351,12 @@ impl Proxy for UnixProxy {
 
     fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
+
+        if self.status == ProxyStatus::Connected {
+            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+            self.push_connect_rsp(0);
+            return update;
+        }
 
         let addr = UnixAddr::new(&self.path).unwrap();
 

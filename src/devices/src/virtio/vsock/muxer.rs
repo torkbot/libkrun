@@ -553,6 +553,29 @@ impl VsockMuxer {
                         path,
                         listen: false,
                     } => path,
+                    UnixIpcPort::ConnectedFd(fd) => {
+                        let rxq = self.rxq.clone();
+                        let mut unix = UnixProxy::from_connected_fd(
+                            id,
+                            self.cid,
+                            pkt.dst_port(),
+                            pkt.src_port(),
+                            *fd,
+                            mem.clone(),
+                            queue.clone(),
+                            rxq,
+                        )
+                        .unwrap();
+                        let tsi = TsiConnectReq {
+                            peer_port: 0,
+                            addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
+                        };
+                        let update = unix.connect(pkt, tsi);
+                        unix.confirm_connect(pkt);
+                        proxy_map.insert(id, Mutex::new(Box::new(unix)));
+                        self.process_proxy_update(id, update);
+                        return;
+                    }
                     UnixIpcPort::Path { listen: true, .. } | UnixIpcPort::ListenerFd(_) => {
                         warn!("Attempting to connect a socket that is listening, sending rst");
                         let rx = MuxerRx::Reset {
