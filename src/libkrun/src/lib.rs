@@ -1487,6 +1487,19 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
 
 #[no_mangle]
 pub extern "C" fn krun_add_vsock_port_fd(ctx_id: u32, port: u32, fd: RawFd) -> i32 {
+    add_vsock_port_fd(ctx_id, port, UnixIpcPort::ConnectedFd(fd))
+}
+
+#[no_mangle]
+pub extern "C" fn krun_add_vsock_port_listen_fd(ctx_id: u32, port: u32, fd: RawFd) -> i32 {
+    add_vsock_port_fd(ctx_id, port, UnixIpcPort::ListenerFd(fd))
+}
+
+fn add_vsock_port_fd(ctx_id: u32, port: u32, ipc_port: UnixIpcPort) -> i32 {
+    let fd = match ipc_port {
+        UnixIpcPort::ConnectedFd(fd) | UnixIpcPort::ListenerFd(fd) => fd,
+        UnixIpcPort::Path { .. } => return -libc::EINVAL,
+    };
     if fd < 0 {
         return -libc::EINVAL;
     }
@@ -1497,7 +1510,7 @@ pub extern "C" fn krun_add_vsock_port_fd(ctx_id: u32, port: u32, fd: RawFd) -> i
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
             }
-            cfg.add_vsock_port(port, UnixIpcPort::ListenerFd(fd));
+            cfg.add_vsock_port(port, ipc_port);
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
