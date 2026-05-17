@@ -48,4 +48,4 @@ vm-memory = { version = "0.17", features = ["backend-mmap"] }
 
 [lib]
 name = "krun"
-crate-type = ["cdylib", "lib"]
+crate-type = ["lib"]
