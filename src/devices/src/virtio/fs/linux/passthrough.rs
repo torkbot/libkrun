@@ -33,7 +33,7 @@ const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
 
-static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
+static INIT_BINARY: &[u8] = b"";
 
 type Inode = u64;
 type Handle = u64;
@@ -1236,6 +1236,9 @@ impl FileSystem for PassthroughFs {
         debug!("read: {inode:?}");
         if inode == self.init_inode {
             let off: usize = offset.try_into().map_err(|_| einval())?;
+            if off >= INIT_BINARY.len() {
+                return Ok(0);
+            }
             let len = if off + (size as usize) < INIT_BINARY.len() {
                 size as usize
             } else {

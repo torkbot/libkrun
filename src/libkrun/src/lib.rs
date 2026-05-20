@@ -2545,6 +2545,20 @@ pub fn krun_set_direct_block_root(
     KRUN_SUCCESS
 }
 
+#[cfg(not(feature = "tee"))]
+pub fn krun_set_direct_init(ctx_id: u32, init_path: String) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg
+                .get_mut()
+                .set_direct_cmdline_prolog(format!("{DEFAULT_KERNEL_CMDLINE} init={init_path}"));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[no_mangle]
 pub extern "C" fn krun_disable_implicit_console(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {

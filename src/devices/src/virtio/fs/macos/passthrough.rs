@@ -37,7 +37,7 @@ const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
 
 const UID_MAX: u32 = u32::MAX - 1;
 
-static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
+static INIT_BINARY: &[u8] = b"";
 
 type Inode = u64;
 type Handle = u64;
@@ -1460,6 +1460,9 @@ impl FileSystem for PassthroughFs {
             let off: usize = offset
                 .try_into()
                 .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            if off >= INIT_BINARY.len() {
+                return Ok(0);
+            }
             let len = if off + (size as usize) < INIT_BINARY.len() {
                 size as usize
             } else {
