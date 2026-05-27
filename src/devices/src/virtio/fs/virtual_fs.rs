@@ -8,6 +8,7 @@ use super::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
+use super::fuse;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualDirEntry {
@@ -257,7 +258,22 @@ impl FileSystem for VirtualFs {
     where
         F: FnMut(DirEntry) -> io::Result<usize>,
     {
-        for (index, entry) in self.backend.readdir(inode)?.iter().enumerate() {
+        let synthetic_entries = [
+            VirtualDirEntry {
+                inode,
+                type_: u32::from(libc::DT_DIR),
+                name: b".".to_vec(),
+            },
+            VirtualDirEntry {
+                inode: fuse::ROOT_ID,
+                type_: u32::from(libc::DT_DIR),
+                name: b"..".to_vec(),
+            },
+        ];
+        let backend_entries = self.backend.readdir(inode)?;
+        let entries = synthetic_entries.iter().chain(backend_entries.iter());
+
+        for (index, entry) in entries.enumerate() {
             let next_offset = (index + 1) as u64;
             if next_offset <= offset {
                 continue;
