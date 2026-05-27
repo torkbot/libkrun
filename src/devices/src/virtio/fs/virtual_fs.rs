@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use super::bindings;
 use super::filesystem::{
-    Context, DirEntry, Entry, FileSystem, FsOptions, OpenOptions, SetattrValid, ZeroCopyReader,
-    ZeroCopyWriter,
+    Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
+    SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +67,11 @@ pub trait VirtualFsBackend: Send + Sync + 'static {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
+    fn link(&self, inode: u64, newparent: u64, newname: &CStr) -> io::Result<Entry> {
+        let _ = (inode, newparent, newname);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
     fn symlink(&self, linkname: &CStr, parent: u64, name: &CStr) -> io::Result<Entry> {
         let _ = (linkname, parent, name);
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
@@ -74,6 +79,26 @@ pub trait VirtualFsBackend: Send + Sync + 'static {
 
     fn readlink(&self, inode: u64) -> io::Result<Vec<u8>> {
         let _ = inode;
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn setxattr(&self, inode: u64, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+        let _ = (inode, name, value, flags);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn getxattr(&self, inode: u64, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+        let _ = (inode, name, size);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn listxattr(&self, inode: u64, size: u32) -> io::Result<ListxattrReply> {
+        let _ = (inode, size);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn removexattr(&self, inode: u64, name: &CStr) -> io::Result<()> {
+        let _ = (inode, name);
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 }
@@ -295,6 +320,16 @@ impl FileSystem for VirtualFs {
         self.backend.rename(olddir, oldname, newdir, newname, flags)
     }
 
+    fn link(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        newparent: Self::Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
+        self.backend.link(inode, newparent, newname)
+    }
+
     fn symlink(
         &self,
         _ctx: Context,
@@ -308,5 +343,39 @@ impl FileSystem for VirtualFs {
 
     fn readlink(&self, _ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
         self.backend.readlink(inode)
+    }
+
+    fn setxattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        self.backend.setxattr(inode, name, value, flags)
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        self.backend.getxattr(inode, name, size)
+    }
+
+    fn listxattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
+        self.backend.listxattr(inode, size)
+    }
+
+    fn removexattr(&self, _ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
+        self.backend.removexattr(inode, name)
     }
 }
