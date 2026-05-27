@@ -578,11 +578,12 @@ pub trait FileSystem {
     /// until the lookup count goes to zero. See the documentation of the `forget` function for more
     /// information.
     ///
-    /// `flags` may be `libc::RENAME_EXCHANGE` or `libc::RENAME_NOREPLACE`. If
-    /// `libc::RENAME_NOREPLACE` is specified, the implementation must not overwrite `newname` if it
-    /// exists and must return an error instead. If `libc::RENAME_EXCHANGE` is specified, the
-    /// implementation must atomically exchange the two files, i.e., both must exist and neither may
-    /// be deleted.
+    /// `flags` may be `libc::RENAME_EXCHANGE`, `libc::RENAME_NOREPLACE`, or
+    /// `libc::RENAME_WHITEOUT`. If `libc::RENAME_NOREPLACE` is specified, the implementation must
+    /// not overwrite `newname` if it exists and must return an error instead. If
+    /// `libc::RENAME_EXCHANGE` is specified, the implementation must atomically exchange the two
+    /// files, i.e., both must exist and neither may be deleted. If `libc::RENAME_WHITEOUT` is
+    /// specified, the implementation must leave a whiteout at `oldname`.
     fn rename(
         &self,
         ctx: Context,
