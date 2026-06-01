@@ -20,7 +20,8 @@ use super::super::{
 use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
-use super::worker::FsWorker;
+use super::virtual_fs::{VirtualFs, VirtualFsBackend};
+use super::worker::{FsBackend, FsWorker};
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 use crate::virtio::passthrough::PermissionSemantics;
@@ -50,9 +51,7 @@ pub struct Fs {
     config: VirtioFsConfig,
     allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
-    passthrough_cfg: Option<passthrough::Config>,
-    read_only: bool,
-    virtual_entries: Vec<VirtualDirEntry>,
+    backend: DeviceFsBackend,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
@@ -60,17 +59,47 @@ pub struct Fs {
     map_sender: Option<Sender<WorkerMessage>>,
 }
 
+enum DeviceFsBackend {
+    Passthrough {
+        config: passthrough::Config,
+        read_only: bool,
+        virtual_entries: Vec<VirtualDirEntry>,
+    },
+    Null {
+        virtual_entries: Vec<VirtualDirEntry>,
+    },
+    Virtual(VirtualFs),
+}
+
+impl DeviceFsBackend {
+    fn worker_backend(&self) -> FsBackend {
+        match self {
+            DeviceFsBackend::Passthrough {
+                config,
+                read_only,
+                virtual_entries,
+            } => FsBackend::Passthrough {
+                config: config.clone(),
+                read_only: *read_only,
+                virtual_entries: virtual_entries.clone(),
+            },
+            DeviceFsBackend::Null { virtual_entries } => FsBackend::Null {
+                virtual_entries: virtual_entries.clone(),
+            },
+            DeviceFsBackend::Virtual(fs) => FsBackend::Virtual(fs.clone()),
+        }
+    }
+}
+
 impl Fs {
     pub fn new(
         fs_id: String,
         semantics: PermissionSemantics,
-        shared_dir: Option<String>,
+        shared_dir: String,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
     ) -> super::Result<Fs> {
-        let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
-
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
@@ -84,14 +113,70 @@ impl Fs {
             Duration::from_secs(5)
         };
 
-        let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
-            root_dir,
+        let fs_cfg = passthrough::Config {
+            root_dir: shared_dir,
             semantics,
             attr_timeout,
             ..Default::default()
-        });
+        };
 
         let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
+
+        Self::from_backend(
+            config,
+            DeviceFsBackend::Passthrough {
+                config: fs_cfg,
+                read_only,
+                virtual_entries,
+            },
+            allow_idmap,
+            exit_code,
+        )
+    }
+
+    pub fn new_null(
+        fs_id: String,
+        exit_code: Arc<AtomicI32>,
+        virtual_entries: Vec<VirtualDirEntry>,
+    ) -> super::Result<Fs> {
+        let tag = fs_id.into_bytes();
+        let mut config = VirtioFsConfig::default();
+        config.tag[..tag.len()].copy_from_slice(tag.as_slice());
+        config.num_request_queues = 1;
+
+        Self::from_backend(
+            config,
+            DeviceFsBackend::Null { virtual_entries },
+            false,
+            exit_code,
+        )
+    }
+
+    pub fn new_virtual(
+        fs_id: String,
+        backend: Arc<dyn VirtualFsBackend>,
+        exit_code: Arc<AtomicI32>,
+    ) -> super::Result<Fs> {
+        let tag = fs_id.into_bytes();
+        let mut config = VirtioFsConfig::default();
+        config.tag[..tag.len()].copy_from_slice(tag.as_slice());
+        config.num_request_queues = 1;
+
+        Self::from_backend(
+            config,
+            DeviceFsBackend::Virtual(VirtualFs::new(backend)),
+            false,
+            exit_code,
+        )
+    }
+
+    fn from_backend(
+        config: VirtioFsConfig,
+        backend: DeviceFsBackend,
+        allow_idmap: bool,
+        exit_code: Arc<AtomicI32>,
+    ) -> super::Result<Fs> {
+        let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
         Ok(Fs {
             avail_features,
@@ -100,9 +185,7 @@ impl Fs {
             config,
             allow_idmap,
             shm_region: None,
-            passthrough_cfg: fs_cfg,
-            read_only,
-            virtual_entries,
+            backend,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -122,16 +205,16 @@ impl Fs {
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
         static FS_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
-        let Some(cfg) = self.passthrough_cfg.as_mut() else {
-            // NullFs-backed devices have no passthrough config and don't
-            // participate in cross-domain fd export. Consume (and waste) an
-            // fsid so numbering stays dense, but don't store the table.
-            return FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-        };
-        cfg.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-        cfg.export_table = Some(export_table);
-
-        cfg.export_fsid
+        match &mut self.backend {
+            DeviceFsBackend::Passthrough { config, .. } => {
+                config.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+                config.export_table = Some(export_table);
+                config.export_fsid
+            }
+            DeviceFsBackend::Null { .. } | DeviceFsBackend::Virtual(_) => {
+                FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed)
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -205,7 +288,6 @@ impl VirtioDevice for Fs {
             queue_evts.push(dq.event);
         }
 
-        let virtual_entries = self.virtual_entries.clone();
         let worker = FsWorker::new(
             worker_queues,
             queue_evts,
@@ -213,9 +295,7 @@ impl VirtioDevice for Fs {
             mem.clone(),
             self.allow_idmap,
             self.shm_region.clone(),
-            self.passthrough_cfg.clone(),
-            self.read_only,
-            virtual_entries,
+            self.backend.worker_backend(),
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
             #[cfg(target_os = "macos")]

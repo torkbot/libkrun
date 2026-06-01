@@ -10,6 +10,7 @@ mod null_fs;
 mod read_only;
 mod server;
 pub mod virtual_entry;
+mod virtual_fs;
 mod worker;
 
 #[cfg(target_os = "linux")]
@@ -41,6 +42,7 @@ pub use self::filesystem::{
     ListxattrReply, OpenOptions, RemovemappingOne, SecContext, SetattrValid, ZeroCopyReader,
     ZeroCopyWriter,
 };
+pub use self::virtual_fs::{VirtualFs, VirtualFsBackend};
 
 mod defs {
     use super::super::QueueConfig;

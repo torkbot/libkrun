@@ -76,7 +76,7 @@ use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use crate::vmm_config::fs::FsDeviceConfig;
+use crate::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig};
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 #[cfg(target_os = "linux")]
 use crate::vstate::KvmContext;
@@ -2148,14 +2148,30 @@ fn attach_fs_devices(
 
     for (i, config) in fs_devs.iter().enumerate() {
         let fs = Arc::new(Mutex::new(
-            devices::virtio::Fs::new(
-                config.fs_id.clone(),
-                PermissionSemantics::LinuxComplete,
-                config.shared_dir.clone(),
-                exit_code.clone(),
-                config.read_only,
-                config.virtual_entries.clone(),
-            )
+            match &config.backend {
+                FsDeviceBackend::Passthrough {
+                    shared_dir,
+                    read_only,
+                    virtual_entries,
+                } => devices::virtio::Fs::new(
+                    config.fs_id.clone(),
+                    PermissionSemantics::LinuxComplete,
+                    shared_dir.clone(),
+                    exit_code.clone(),
+                    *read_only,
+                    virtual_entries.clone(),
+                ),
+                FsDeviceBackend::Null { virtual_entries } => devices::virtio::Fs::new_null(
+                    config.fs_id.clone(),
+                    exit_code.clone(),
+                    virtual_entries.clone(),
+                ),
+                FsDeviceBackend::Virtual { backend } => devices::virtio::Fs::new_virtual(
+                    config.fs_id.clone(),
+                    backend.clone(),
+                    exit_code.clone(),
+                ),
+            }
             .unwrap(),
         ));
 

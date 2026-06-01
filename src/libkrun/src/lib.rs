@@ -8,6 +8,8 @@ use devices::display::DisplayInfo;
 use devices::virtio::CacheType;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use devices::virtio::fs::VirtualFsBackend;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
 use devices::virtio::UnixIpcPort;
@@ -37,8 +39,8 @@ use std::os::windows::io::BorrowedHandle;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::LazyLock;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::pollable_channel::PollableChannelSender;
@@ -59,7 +61,7 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use vmm::vmm_config::fs::FsDeviceConfig;
+use vmm::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig};
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
@@ -326,7 +328,7 @@ impl ContextConfig {
     }
 
     fn add_vsock_port(&mut self, port: u32, ipc_port: UnixIpcPort) {
-        if let Some(ref mut map) = &mut self.unix_ipc_port_map {
+        if let Some(map) = &mut self.unix_ipc_port_map {
             map.insert(port, ipc_port);
         } else {
             let mut map: HashMap<u32, UnixIpcPort> = HashMap::new();
@@ -369,7 +371,15 @@ impl TryFrom<ContextConfig> for NitroEnclave {
             return Err(-libc::EINVAL);
         };
 
-        let Some(rootfs) = ctx.vmr.fs.first().and_then(|p| p.shared_dir.clone()) else {
+        let rootfs = if let Some(path) = &ctx.vmr.fs.first() {
+            match &path.backend {
+                FsDeviceBackend::Passthrough { shared_dir, .. } => shared_dir.clone(),
+                FsDeviceBackend::Null { .. } | FsDeviceBackend::Virtual { .. } => {
+                    error!("virtual rootfs is not supported for nitro enclaves");
+                    return Err(-libc::EINVAL);
+                }
+            }
+        } else {
             error!("rootfs path required");
             return Err(-libc::EINVAL);
         };
@@ -660,10 +670,15 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                 }
                 cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id: tag.to_string(),
-                    shared_dir: path.map(|p| p.to_string()),
+                    backend: match path {
+                        Some(path) => FsDeviceBackend::Passthrough {
+                            shared_dir: path.to_string(),
+                            read_only,
+                            virtual_entries,
+                        },
+                        None => FsDeviceBackend::Null { virtual_entries },
+                    },
                     shm_size: shm,
-                    read_only,
-                    virtual_entries,
                 });
             }
             Entry::Vacant(_) => return -libc::ENOENT,
@@ -671,6 +686,28 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
 
         KRUN_SUCCESS
     }
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub fn krun_add_virtual_virtiofs(
+    ctx_id: u32,
+    tag: String,
+    backend: Arc<dyn VirtualFsBackend>,
+    shm_size: Option<usize>,
+) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id: tag,
+                backend: FsDeviceBackend::Virtual { backend },
+                shm_size,
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -1353,7 +1390,7 @@ pub extern "C" fn krun_add_vsock_port_fd(ctx_id: u32, port: u32, fd: RawFd) -> i
     add_vsock_port_fd(ctx_id, port, UnixIpcPort::ConnectedFd(fd))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn krun_add_vsock_port_listen_fd(ctx_id: u32, port: u32, fd: RawFd) -> i32 {
     add_vsock_port_fd(ctx_id, port, UnixIpcPort::ListenerFd(fd))
 }
@@ -2230,14 +2267,15 @@ pub unsafe extern "C" fn krun_set_kernel_bundle_raw(
     };
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => match ctx_cfg.get_mut().vmr.set_kernel_bundle(kernel_bundle)
-        {
-            Ok(()) => KRUN_SUCCESS,
-            Err(error) => {
-                error!("Invalid kernel bundle: {error}");
-                -libc::EINVAL
+        Entry::Occupied(mut ctx_cfg) => {
+            match ctx_cfg.get_mut().vmr.set_kernel_bundle(kernel_bundle) {
+                Ok(()) => KRUN_SUCCESS,
+                Err(error) => {
+                    error!("Invalid kernel bundle: {error}");
+                    -libc::EINVAL
+                }
             }
-        },
+        }
         Entry::Vacant(_) => -libc::ENOENT,
     }
 }
@@ -2355,11 +2393,9 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
 
                 ctx_cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id: "/dev/root".into(),
-                    shared_dir: None,
+                    backend: FsDeviceBackend::Null { virtual_entries },
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
-                    read_only: false,
-                    virtual_entries,
                 });
 
                 ctx_cfg.set_block_root(device, fstype, options);
@@ -2436,8 +2472,15 @@ fn fs_add_overlay_entry(ctx_id: u32, fs_tag: &str, path: &str, entry: VirtualEnt
                 Some(fs) => fs,
                 None => return -libc::ENOENT,
             };
+            let virtual_entries = match &mut fs_cfg.backend {
+                FsDeviceBackend::Passthrough {
+                    virtual_entries, ..
+                }
+                | FsDeviceBackend::Null { virtual_entries } => virtual_entries,
+                FsDeviceBackend::Virtual { .. } => return -libc::ENOTSUP,
+            };
             let (parent_children, name) =
-                match resolve_overlay_path(&mut fs_cfg.virtual_entries, path) {
+                match resolve_overlay_path(virtual_entries, path) {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
