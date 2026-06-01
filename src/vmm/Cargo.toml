@@ -36,6 +36,7 @@ devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../d
 kernel = { package = "krun-kernel", version = "=0.1.0-2.0.0-dev", path = "../kernel" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
+imago = { version = "0.2.3", features = ["sync-wrappers"] }
 
 # Dependencies for amd-sev
 kbs-types = { version = "0.13.0", optional = true }

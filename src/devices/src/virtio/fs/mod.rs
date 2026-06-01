@@ -42,7 +42,7 @@ pub use self::filesystem::{
     ListxattrReply, OpenOptions, RemovemappingOne, SecContext, SetattrValid, ZeroCopyReader,
     ZeroCopyWriter,
 };
-pub use self::virtual_fs::{VirtualFs, VirtualFsBackend};
+pub use self::virtual_fs::{VirtualDirEntry, VirtualFs, VirtualFsBackend};
 
 mod defs {
     use super::super::QueueConfig;

@@ -803,6 +803,7 @@ dependencies = [
  "bzip2",
  "crossbeam-channel",
  "flate2",
+ "imago",
  "iocuddle",
  "kbs-types",
  "krun-arch",
@@ -877,6 +878,7 @@ version = "2.0.0-dev"
 dependencies = [
  "crossbeam-channel",
  "env_logger",
+ "imago",
  "krun-aws-nitro",
  "krun-devices",
  "krun-display",
@@ -893,6 +895,7 @@ dependencies = [
  "log",
  "nitro-enclaves 0.5.0",
  "once_cell",
+ "rand 0.9.2",
  "vm-memory",
  "windows-sys",
 ]

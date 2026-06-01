@@ -18,8 +18,8 @@ use super::super::{
 };
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
-use super::{defs, defs::uapi};
 use super::{TsiFlags, UnixIpcPort};
+use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
 pub(crate) const RXQ_INDEX: usize = 0;

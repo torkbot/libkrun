@@ -6,13 +6,13 @@ use crossbeam_channel::unbounded;
 use devices::display::DisplayInfo;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
+use devices::virtio::UnixIpcPort;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::VirtualFsBackend;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
-use devices::virtio::UnixIpcPort;
 use env_logger::{Env, Target};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -54,6 +54,8 @@ use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
 };
+#[cfg(feature = "blk")]
+use vmm::vmm_config::block::BlockDeviceSource;
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
@@ -741,8 +743,10 @@ pub unsafe extern "C" fn krun_add_disk(
                 let block_device_config = BlockDeviceConfig {
                     block_id: block_id.to_string(),
                     cache_type: CacheType::auto(disk_path),
-                    disk_image_path: disk_path.to_string(),
-                    disk_image_format: ImageType::Raw,
+                    source: BlockDeviceSource::Path {
+                        disk_image_path: disk_path.to_string(),
+                        disk_image_format: ImageType::Raw,
+                    },
                     is_disk_read_only: read_only,
                     direct_io: false,
                     #[cfg(not(target_os = "macos"))]
@@ -791,8 +795,10 @@ pub unsafe extern "C" fn krun_add_disk2(
                 let block_device_config = BlockDeviceConfig {
                     block_id: block_id.to_string(),
                     cache_type: CacheType::auto(disk_path),
-                    disk_image_path: disk_path.to_string(),
-                    disk_image_format: format,
+                    source: BlockDeviceSource::Path {
+                        disk_image_path: disk_path.to_string(),
+                        disk_image_format: format,
+                    },
                     is_disk_read_only: read_only,
                     direct_io: false,
                     #[cfg(not(target_os = "macos"))]
@@ -848,8 +854,10 @@ pub unsafe extern "C" fn krun_add_disk3(
                 let block_device_config = BlockDeviceConfig {
                     block_id: block_id.to_string(),
                     cache_type: CacheType::auto(disk_path),
-                    disk_image_path: disk_path.to_string(),
-                    disk_image_format: format,
+                    source: BlockDeviceSource::Path {
+                        disk_image_path: disk_path.to_string(),
+                        disk_image_format: format,
+                    },
                     is_disk_read_only: read_only,
                     direct_io,
                     sync_mode,
@@ -863,6 +871,39 @@ pub unsafe extern "C" fn krun_add_disk3(
     }
 }
 
+#[cfg(feature = "blk")]
+pub fn krun_add_storage_disk(
+    ctx_id: u32,
+    block_id: String,
+    disk_image: std::sync::Arc<
+        std::sync::Mutex<imago::SyncFormatAccess<Box<dyn imago::DynStorage>>>,
+    >,
+    read_only: bool,
+    sync_mode: u32,
+) -> i32 {
+    let sync_mode = match SyncMode::try_from(sync_mode) {
+        Ok(mode) => mode,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            let block_device_config = BlockDeviceConfig {
+                block_id,
+                cache_type: CacheType::Writeback,
+                source: BlockDeviceSource::Storage { disk_image },
+                is_disk_read_only: read_only,
+                direct_io: false,
+                sync_mode,
+            };
+            cfg.add_block_cfg(block_device_config);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
 /*
  * Send the VFKIT magic after establishing the connection,
  * as required by gvproxy in vfkit mode.
@@ -1381,7 +1422,13 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
                 if cfg.vsock_config == VsockConfig::Disabled {
                     return -libc::ENODEV;
                 }
-                cfg.add_vsock_port(port, UnixIpcPort::Path { path: filepath, listen });
+                cfg.add_vsock_port(
+                    port,
+                    UnixIpcPort::Path {
+                        path: filepath,
+                        listen,
+                    },
+                );
             }
             Entry::Vacant(_) => return -libc::ENOENT,
         }

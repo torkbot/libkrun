@@ -1,8 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-use devices::virtio::fs::virtual_entry::VirtualDirEntry;
 use devices::virtio::fs::VirtualFsBackend;
+use devices::virtio::fs::virtual_entry::VirtualDirEntry;
 
 #[derive(Clone)]
 pub struct FsDeviceConfig {

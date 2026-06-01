@@ -367,6 +367,65 @@ impl Block {
         })
     }
 
+    pub fn new_with_storage(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        is_disk_read_only: bool,
+        sync_mode: SyncMode,
+    ) -> io::Result<Block> {
+        let mut disk_image_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
+        let id_bytes = id.as_bytes();
+        let bytes_to_copy = cmp::min(id_bytes.len(), VIRTIO_BLK_ID_BYTES as usize);
+        disk_image_id[..bytes_to_copy].copy_from_slice(&id_bytes[..bytes_to_copy]);
+        let discard_alignment = 512;
+        let disk_properties =
+            DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_BLK_F_SEG_MAX)
+            | (1u64 << VIRTIO_BLK_F_DISCARD)
+            | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+
+        if sync_mode != SyncMode::None {
+            avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
+        }
+
+        if is_disk_read_only {
+            avail_features |= 1u64 << VIRTIO_BLK_F_RO;
+        };
+
+        let config = VirtioBlkConfig {
+            capacity: disk_properties.nsectors(),
+            size_max: 0,
+            seg_max: 254,
+            max_discard_sectors: u32::MAX,
+            max_discard_seg: 1,
+            discard_sector_alignment: discard_alignment / 512,
+            max_write_zeroes_sectors: u32::MAX,
+            max_write_zeroes_seg: 1,
+            write_zeroes_may_unmap: 1,
+            ..Default::default()
+        };
+
+        Ok(Block {
+            id,
+            partuuid,
+            config,
+            disk: Some(disk_properties),
+            cache_type,
+            disk_image,
+            disk_image_id,
+            avail_features,
+            acked_features: 0u64,
+            device_state: DeviceState::Inactive,
+            worker_thread: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+        })
+    }
+
     /// Provides the ID of this block device.
     pub fn id(&self) -> &String {
         &self.id
