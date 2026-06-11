@@ -10,8 +10,9 @@ use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::bitmap::Bitmap;
-use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
+use vm_memory::VolatileSlice;
 
+use crate::virtio::file_traits::FileReadWriteVolatile;
 use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties};
 
 pub fn stdin() -> Result<Box<dyn PortInput + Send>, nix::Error> {
@@ -56,7 +57,7 @@ pub fn output_file(file: File) -> Result<Box<dyn PortOutput + Send>, nix::Error>
 pub fn output_to_raw_fd_dup(fd: RawFd) -> Result<Box<dyn PortOutput + Send>, nix::Error> {
     let fd = dup_raw_fd_into_owned(fd)?;
     make_non_blocking(&fd)?;
-    Ok(Box::new(PortOutputFd(fd)))
+    Ok(Box::new(PortOutputFd(File::from(fd))))
 }
 
 struct PortInputFd(OwnedFd);
@@ -126,7 +127,7 @@ impl PortInput for PortInputEmpty {
     }
 }
 
-struct PortOutputFd(OwnedFd);
+struct PortOutputFd(File);
 
 impl AsRawFd for PortOutputFd {
     fn as_raw_fd(&self) -> RawFd {
@@ -136,13 +137,7 @@ impl AsRawFd for PortOutputFd {
 
 impl PortOutput for PortOutputFd {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
-        self.0.write_volatile(buf).map_err(|e| match e {
-            VolatileMemoryError::IOError(e) => e,
-            e => {
-                log::error!("Unsuported error from write_volatile: {e:?}");
-                io::Error::other(e)
-            }
-        })
+        FileReadWriteVolatile::write_volatile(&mut self.0, *buf)
     }
 
     fn wait_until_writable(&self) {
