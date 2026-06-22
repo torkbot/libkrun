@@ -4,9 +4,9 @@ use std::hash::Hash;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::AtomicI32;
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -128,6 +128,8 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> MaskFs<L> {
             Some(PassthroughFs::new(
                 passthrough::Config {
                     root_dir: storage,
+                    entry_timeout: Duration::ZERO,
+                    attr_timeout: Duration::ZERO,
                     ..Default::default()
                 },
                 inode_alloc,
@@ -1268,6 +1270,8 @@ mod tests {
         let preexisting = CString::new("preexisting").unwrap();
         let entry = fs.lookup(ctx, fuse::ROOT_ID, &preexisting).unwrap();
         assert_eq!(entry.attr.st_size, "upper-preexisting".len() as i64);
+        assert_eq!(entry.entry_timeout, Duration::ZERO);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
 
         let node_modules = CString::new("node_modules").unwrap();
         let err = match fs.lookup(ctx, fuse::ROOT_ID, &node_modules) {
@@ -1289,6 +1293,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entry.attr.st_size, 0);
+        assert_eq!(entry.entry_timeout, Duration::ZERO);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
         assert!(storage.path.join("node_modules").is_file());
         assert!(source.path.join("node_modules").is_dir());
     }

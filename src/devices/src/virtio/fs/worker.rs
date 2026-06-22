@@ -6,11 +6,12 @@ use utils::worker_message::WorkerMessage;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
+use std::sync::Arc;
 use std::thread;
 #[cfg(windows)]
 use utils::windows::AsRawFd;
+use std::time::Duration;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -170,6 +171,7 @@ impl FsWorker {
                 virtual_entries,
                 mask: Some(mask),
             } => {
+                let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFsRo::new(config, inode_alloc.clone())?;
                 let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
                 FsServer::MaskedReadOnly(Server::new(AugmentFs::new(
@@ -197,6 +199,7 @@ impl FsWorker {
                 mask: Some(mask),
                 ..
             } => {
+                let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFs::new(config, inode_alloc.clone())?;
                 let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
                 FsServer::MaskedReadWrite(Server::new(AugmentFs::new(
@@ -347,5 +350,31 @@ impl FsWorker {
                 self.interrupt.signal_used_queue();
             }
         }
+    }
+}
+
+fn uncached_masked_passthrough_config(mut config: passthrough::Config) -> passthrough::Config {
+    // A masked mount can intentionally answer a parent/name lookup from upper
+    // storage even when a lower child exists. Passthrough dentry caching can
+    // otherwise let the guest reuse the lower child across later operations.
+    config.entry_timeout = Duration::ZERO;
+    config.attr_timeout = Duration::ZERO;
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masked_passthrough_config_disables_entry_and_attr_caches() {
+        let config = uncached_masked_passthrough_config(passthrough::Config {
+            root_dir: "/mask-lower".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(config.root_dir, "/mask-lower");
+        assert_eq!(config.entry_timeout, Duration::ZERO);
+        assert_eq!(config.attr_timeout, Duration::ZERO);
     }
 }
