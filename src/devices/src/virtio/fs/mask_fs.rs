@@ -33,7 +33,6 @@ const SYNTHETIC_READDIR_OFFSET: u64 = 1 << 63;
 pub struct MaskConfig {
     pub paths: Vec<String>,
     pub storage: Option<String>,
-    pub case_insensitive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -125,8 +124,13 @@ impl MaskSet {
 }
 
 impl<L: FileSystem<Inode = Inode, Handle = Handle>> MaskFs<L> {
-    pub fn new(lower: L, config: MaskConfig, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
-        let masks = MaskSet::new(config.paths, config.case_insensitive);
+    pub fn new(
+        lower: L,
+        config: MaskConfig,
+        inode_alloc: Arc<InodeAllocator>,
+        case_insensitive: bool,
+    ) -> io::Result<Self> {
+        let masks = MaskSet::new(config.paths, case_insensitive);
         let upper = if let Some(storage) = config.storage {
             std::fs::create_dir_all(&storage)?;
             for path in &masks.paths {
@@ -1252,9 +1256,9 @@ mod tests {
             MaskConfig {
                 paths: vec!["/node_modules".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
-                case_insensitive: false,
             },
             inode_alloc,
+            false,
         )
         .unwrap();
 
@@ -1289,9 +1293,9 @@ mod tests {
             MaskConfig {
                 paths: vec!["/node_modules".to_string(), "/preexisting".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
-                case_insensitive: false,
             },
             inode_alloc,
+            false,
         )
         .unwrap();
         fs.init(FsOptions::empty()).unwrap();
@@ -1368,9 +1372,9 @@ mod tests {
             MaskConfig {
                 paths: vec!["/.git".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
-                case_insensitive: true,
             },
             inode_alloc,
+            true,
         )
         .unwrap();
         fs.init(FsOptions::empty()).unwrap();

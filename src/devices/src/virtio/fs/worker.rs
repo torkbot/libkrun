@@ -173,10 +173,10 @@ impl FsWorker {
                 virtual_entries,
                 mask: Some(mask),
             } => {
-                let mask = configured_mask(mask, &config.root_dir)?;
+                let case_insensitive = host_path_is_case_insensitive(&config.root_dir)?;
                 let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFsRo::new(config, inode_alloc.clone())?;
-                let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
+                let inner = MaskFs::new(lower, mask, inode_alloc.clone(), case_insensitive)?;
                 FsServer::MaskedReadOnly(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
@@ -202,10 +202,10 @@ impl FsWorker {
                 mask: Some(mask),
                 ..
             } => {
-                let mask = configured_mask(mask, &config.root_dir)?;
+                let case_insensitive = host_path_is_case_insensitive(&config.root_dir)?;
                 let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFs::new(config, inode_alloc.clone())?;
-                let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
+                let inner = MaskFs::new(lower, mask, inode_alloc.clone(), case_insensitive)?;
                 FsServer::MaskedReadWrite(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
@@ -366,11 +366,6 @@ fn uncached_masked_passthrough_config(mut config: passthrough::Config) -> passth
     config
 }
 
-fn configured_mask(mut mask: MaskConfig, root_dir: &str) -> io::Result<MaskConfig> {
-    mask.case_insensitive = host_path_is_case_insensitive(root_dir)?;
-    Ok(mask)
-}
-
 #[cfg(target_os = "macos")]
 fn host_path_is_case_insensitive(path: &str) -> io::Result<bool> {
     let path = CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -404,17 +399,7 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn configured_mask_uses_case_sensitive_matching_by_default() {
-        let mask = configured_mask(
-            MaskConfig {
-                paths: vec!["/.git".to_string()],
-                storage: None,
-                case_insensitive: true,
-            },
-            "/unused",
-        )
-        .unwrap();
-
-        assert!(!mask.case_insensitive);
+    fn non_macos_hosts_use_case_sensitive_mask_matching() {
+        assert!(!host_path_is_case_insensitive("/unused").unwrap());
     }
 }
