@@ -346,12 +346,16 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         let lower = self.lower.init(capable)?;
-        if let Some(upper) = &self.upper {
+        let opts = if let Some(upper) = &self.upper {
             let upper = upper.init(capable)?;
-            Ok(lower & upper)
+            lower & upper
         } else {
-            Ok(lower)
-        }
+            lower
+        };
+        // MaskFs composes a lower filesystem with optional upper storage.  Plain readdir keeps
+        // lookup routing under MaskFs control, while readdirplus lets the guest kernel cache
+        // entries returned during directory scans with lookup counts attached.
+        Ok(opts & !(FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO))
     }
 
     fn destroy(&self) {
@@ -1215,6 +1219,37 @@ mod tests {
             gid: unsafe { libc::getegid() },
             pid: 0,
         }
+    }
+
+    #[test]
+    fn masked_mounts_do_not_advertise_readdirplus() {
+        let source = TempTree::new("source");
+        let storage = TempTree::new("storage");
+
+        let inode_alloc = Arc::new(InodeAllocator::new());
+        let lower = PassthroughFs::new(
+            passthrough::Config {
+                root_dir: source.path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            inode_alloc.clone(),
+        )
+        .unwrap();
+        let fs = MaskFs::new(
+            lower,
+            MaskConfig {
+                paths: vec!["/node_modules".to_string()],
+                storage: Some(storage.path.to_string_lossy().into_owned()),
+            },
+            inode_alloc,
+        )
+        .unwrap();
+
+        let opts = fs
+            .init(FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO)
+            .unwrap();
+        assert!(!opts.contains(FsOptions::DO_READDIRPLUS));
+        assert!(!opts.contains(FsOptions::READDIRPLUS_AUTO));
     }
 
     #[test]
