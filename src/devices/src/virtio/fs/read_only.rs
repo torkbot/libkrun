@@ -34,6 +34,12 @@ use crate::virtio::linux_errno;
 type Inode = u64;
 type Handle = u64;
 
+fn ignore_read_only_flush_error(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.raw_os_error() == linux_errno::erofs().raw_os_error() => Ok(()),
+        result => result,
+    }
+}
 fn read_only_open_flags(flags: u32) -> io::Result<u32> {
     let f = flags as i32;
     #[cfg(not(target_os = "windows"))]
@@ -134,11 +140,14 @@ impl FileSystem for PassthroughFsRo {
     }
 
     fn flush(&self, ctx: Context, inode: Inode, handle: Handle, lock_owner: u64) -> io::Result<()> {
-        self.inner.flush(ctx, inode, handle, lock_owner)
+        // macOS can report EROFS while closing a duplicated read-only fd after
+        // atime/metadata writeback. A read-only passthrough never opens writable
+        // handles, so read-side flush should not make successful reads fail.
+        ignore_read_only_flush_error(self.inner.flush(ctx, inode, handle, lock_owner))
     }
 
     fn fsync(&self, ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
-        self.inner.fsync(ctx, inode, datasync, handle)
+        ignore_read_only_flush_error(self.inner.fsync(ctx, inode, datasync, handle))
     }
 
     fn release(
@@ -237,7 +246,7 @@ impl FileSystem for PassthroughFsRo {
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
-        self.inner.fsyncdir(ctx, inode, datasync, handle)
+        ignore_read_only_flush_error(self.inner.fsyncdir(ctx, inode, datasync, handle))
     }
 
     fn releasedir(&self, ctx: Context, inode: Inode, flags: u32, handle: Handle) -> io::Result<()> {
@@ -487,8 +496,9 @@ impl FileSystem for PassthroughFsRo {
 
 #[cfg(test)]
 mod tests {
-    use super::linux_errno;
-    use super::read_only_open_flags;
+    use std::io;
+
+    use super::{ignore_read_only_flush_error, linux_errno, read_only_open_flags};
     #[cfg(target_os = "windows")]
     use super::windows::fs_utils;
 
@@ -517,5 +527,18 @@ mod tests {
         let err = read_only_open_flags((libc::O_RDONLY | libc::O_TRUNC) as u32).unwrap_err();
 
         assert_eq!(err.raw_os_error(), linux_errno::erofs().raw_os_error());
+    }
+
+    #[test]
+    fn read_only_flush_ignores_erofs() {
+        ignore_read_only_flush_error(Err(linux_errno::erofs())).unwrap();
+    }
+
+    #[test]
+    fn read_only_flush_preserves_other_errors() {
+        let err = ignore_read_only_flush_error(Err(io::Error::from_raw_os_error(libc::EBADF)))
+            .unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
     }
 }
