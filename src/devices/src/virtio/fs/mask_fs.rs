@@ -898,19 +898,16 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
             let mut visible = 0usize;
             let mut stopped = false;
             let mut last_offset = current_offset;
-            self.lower.readdirplus(
-                ctx,
-                inode,
-                handle,
-                size,
-                current_offset,
-                |dir_entry, entry| {
+            self.lower
+                .readdir(ctx, inode, handle, size, current_offset, |dir_entry| {
                     callbacks += 1;
                     last_offset = dir_entry.offset;
                     if self.masks.is_direct_child(&route.path, dir_entry.name) {
-                        self.lower.forget(ctx, entry.inode, 1);
                         return Ok(1);
                     }
+                    let name =
+                        CString::new(dir_entry.name.to_vec()).map_err(|_| linux_errno::einval())?;
+                    let entry = self.lower.lookup(ctx, inode, &name)?;
                     let mut child_path = route.path.clone();
                     child_path.push(dir_entry.name.to_vec());
                     self.record_entry(Backend::Lower, child_path, &entry);
@@ -920,8 +917,7 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
                         stopped = true;
                     }
                     Ok(result)
-                },
-            )?;
+                })?;
             if stopped {
                 return Ok(());
             }
@@ -1259,6 +1255,19 @@ mod tests {
         fs.init(FsOptions::empty()).unwrap();
 
         let ctx = context();
+        let (handle, _) = fs
+            .opendir(ctx, fuse::ROOT_ID, libc::O_RDONLY as u32)
+            .unwrap();
+        let handle = handle.expect("passthrough directories use handles");
+        let mut names = Vec::new();
+        fs.readdirplus(ctx, fuse::ROOT_ID, handle, 4096, 0, |dir_entry, _| {
+            names.push(String::from_utf8(dir_entry.name.to_vec()).unwrap());
+            Ok(1)
+        })
+        .unwrap();
+        fs.releasedir(ctx, fuse::ROOT_ID, 0, handle).unwrap();
+        assert_eq!(names, vec!["preexisting"]);
+
         let preexisting = CString::new("preexisting").unwrap();
         let entry = fs.lookup(ctx, fuse::ROOT_ID, &preexisting).unwrap();
         assert_eq!(entry.attr.st_size, "upper-preexisting".len() as i64);
