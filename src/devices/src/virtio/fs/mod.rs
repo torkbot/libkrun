@@ -4,6 +4,7 @@ mod device;
 mod filesystem;
 pub mod fuse;
 mod inode_alloc;
+pub mod mask_fs;
 #[allow(dead_code)]
 mod multikey;
 mod null_fs;

@@ -2,7 +2,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use devices::virtio::fs::VirtualFsBackend;
+use devices::virtio::fs::mask_fs::MaskConfig;
 use devices::virtio::fs::virtual_entry::VirtualDirEntry;
+
+pub type FsPassthroughMaskConfig = MaskConfig;
 
 #[derive(Clone)]
 pub struct FsDeviceConfig {
@@ -17,6 +20,7 @@ pub enum FsDeviceBackend {
         shared_dir: String,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
+        mask: Option<MaskConfig>,
     },
     Null {
         virtual_entries: Vec<VirtualDirEntry>,
@@ -43,11 +47,13 @@ impl fmt::Debug for FsDeviceBackend {
                 shared_dir,
                 read_only,
                 virtual_entries,
+                mask,
             } => f
                 .debug_struct("Passthrough")
                 .field("shared_dir", shared_dir)
                 .field("read_only", read_only)
                 .field("virtual_entries", virtual_entries)
+                .field("mask", mask)
                 .finish(),
             FsDeviceBackend::Null { virtual_entries } => f
                 .debug_struct("Null")

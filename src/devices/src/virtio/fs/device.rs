@@ -18,6 +18,7 @@ use super::super::{
     VirtioShmRegion,
 };
 use super::ExportTable;
+use super::mask_fs::MaskConfig;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::virtual_fs::{VirtualFs, VirtualFsBackend};
@@ -64,6 +65,7 @@ enum DeviceFsBackend {
         config: passthrough::Config,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
+        mask: Option<MaskConfig>,
     },
     Null {
         virtual_entries: Vec<VirtualDirEntry>,
@@ -78,10 +80,12 @@ impl DeviceFsBackend {
                 config,
                 read_only,
                 virtual_entries,
+                mask,
             } => FsBackend::Passthrough {
                 config: config.clone(),
                 read_only: *read_only,
                 virtual_entries: virtual_entries.clone(),
+                mask: mask.clone(),
             },
             DeviceFsBackend::Null { virtual_entries } => FsBackend::Null {
                 virtual_entries: virtual_entries.clone(),
@@ -99,6 +103,7 @@ impl Fs {
         exit_code: Arc<AtomicI32>,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
+        mask: Option<MaskConfig>,
     ) -> super::Result<Fs> {
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
@@ -128,6 +133,7 @@ impl Fs {
                 config: fs_cfg,
                 read_only,
                 virtual_entries,
+                mask,
             },
             allow_idmap,
             exit_code,

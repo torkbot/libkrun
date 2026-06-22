@@ -2153,6 +2153,7 @@ fn attach_fs_devices(
                     shared_dir,
                     read_only,
                     virtual_entries,
+                    mask,
                 } => devices::virtio::Fs::new(
                     config.fs_id.clone(),
                     PermissionSemantics::LinuxComplete,
@@ -2160,6 +2161,7 @@ fn attach_fs_devices(
                     exit_code.clone(),
                     *read_only,
                     virtual_entries.clone(),
+                    mask.clone(),
                 ),
                 FsDeviceBackend::Null { virtual_entries } => devices::virtio::Fs::new_null(
                     config.fs_id.clone(),

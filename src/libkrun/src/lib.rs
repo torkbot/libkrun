@@ -63,6 +63,8 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use vmm::vmm_config::fs::FsPassthroughMaskConfig;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vmm::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig};
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -666,33 +668,65 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
             None
         };
 
-        match CTX_MAP.lock().unwrap().entry(ctx_id) {
-            Entry::Occupied(mut ctx_cfg) => {
-                let cfg = ctx_cfg.get_mut();
-                #[allow(unused_mut)]
-                let mut virtual_entries = Vec::new();
-                #[cfg(feature = "init-blob")]
-                if tag == "/dev/root" && !cfg.disable_implicit_init {
-                    virtual_entries.push(init_virtual_entry());
-                }
-                cfg.vmr.add_fs_device(FsDeviceConfig {
-                    fs_id: tag.to_string(),
-                    backend: match path {
-                        Some(path) => FsDeviceBackend::Passthrough {
-                            shared_dir: path.to_string(),
-                            read_only,
-                            virtual_entries,
-                        },
-                        None => FsDeviceBackend::Null { virtual_entries },
-                    },
-                    shm_size: shm,
-                });
-            }
-            Entry::Vacant(_) => return -libc::ENOENT,
-        }
-
-        KRUN_SUCCESS
+        krun_add_virtiofs_config(
+            ctx_id,
+            tag.to_string(),
+            path.map(str::to_string),
+            shm,
+            read_only,
+            None,
+        )
     }
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub fn krun_add_virtiofs_masked(
+    ctx_id: u32,
+    tag: String,
+    path: String,
+    shm_size: Option<usize>,
+    read_only: bool,
+    mask: Option<FsPassthroughMaskConfig>,
+) -> i32 {
+    krun_add_virtiofs_config(ctx_id, tag, Some(path), shm_size, read_only, mask)
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+fn krun_add_virtiofs_config(
+    ctx_id: u32,
+    tag: String,
+    path: Option<String>,
+    shm_size: Option<usize>,
+    read_only: bool,
+    mask: Option<FsPassthroughMaskConfig>,
+) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            #[allow(unused_mut)]
+            let mut virtual_entries = Vec::new();
+            #[cfg(feature = "init-blob")]
+            if tag == "/dev/root" && !cfg.disable_implicit_init {
+                virtual_entries.push(init_virtual_entry());
+            }
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id: tag,
+                backend: match path {
+                    Some(path) => FsDeviceBackend::Passthrough {
+                        shared_dir: path,
+                        read_only,
+                        virtual_entries,
+                        mask,
+                    },
+                    None => FsDeviceBackend::Null { virtual_entries },
+                },
+                shm_size,
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

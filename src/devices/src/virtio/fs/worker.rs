@@ -21,6 +21,7 @@ use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
+use super::mask_fs::{MaskConfig, MaskFs};
 use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
@@ -34,6 +35,7 @@ pub enum FsBackend {
         config: passthrough::Config,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
+        mask: Option<MaskConfig>,
     },
     Null {
         virtual_entries: Vec<VirtualDirEntry>,
@@ -44,6 +46,8 @@ pub enum FsBackend {
 enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
+    MaskedReadWrite(Server<AugmentFs<MaskFs<PassthroughFs>>>),
+    MaskedReadOnly(Server<AugmentFs<MaskFs<PassthroughFsRo>>>),
     Null(Server<AugmentFs<NullFs>>),
     Virtual(Server<VirtualFs>),
 }
@@ -69,6 +73,24 @@ impl FsServer {
                 map_sender,
             ),
             FsServer::ReadOnly(s) => s.handle_message(
+                r,
+                w,
+                allow_idmap,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
+            FsServer::MaskedReadWrite(s) => s.handle_message(
+                r,
+                w,
+                allow_idmap,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
+            FsServer::MaskedReadOnly(s) => s.handle_message(
                 r,
                 w,
                 allow_idmap,
@@ -133,6 +155,7 @@ impl FsWorker {
                 config,
                 read_only: true,
                 virtual_entries,
+                mask: None,
             } => {
                 let inner = PassthroughFsRo::new(config, inode_alloc.clone())?;
                 FsServer::ReadOnly(Server::new(AugmentFs::new(
@@ -143,11 +166,40 @@ impl FsWorker {
             }
             FsBackend::Passthrough {
                 config,
+                read_only: true,
                 virtual_entries,
+                mask: Some(mask),
+            } => {
+                let lower = PassthroughFsRo::new(config, inode_alloc.clone())?;
+                let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
+                FsServer::MaskedReadOnly(Server::new(AugmentFs::new(
+                    inner,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
+            }
+            FsBackend::Passthrough {
+                config,
+                virtual_entries,
+                mask: None,
                 ..
             } => {
                 let inner = PassthroughFs::new(config, inode_alloc.clone())?;
                 FsServer::ReadWrite(Server::new(AugmentFs::new(
+                    inner,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
+            }
+            FsBackend::Passthrough {
+                config,
+                virtual_entries,
+                mask: Some(mask),
+                ..
+            } => {
+                let lower = PassthroughFs::new(config, inode_alloc.clone())?;
+                let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
+                FsServer::MaskedReadWrite(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
                     virtual_entries,
