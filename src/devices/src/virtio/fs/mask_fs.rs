@@ -320,7 +320,7 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> MaskFs<L> {
                 Err(error) => return Err(error),
             };
             let dir_entry = DirEntry {
-                ino: entry.inode,
+                ino: entry.attr.st_ino,
                 offset: SYNTHETIC_READDIR_OFFSET + index as u64 + 1,
                 type_: Self::entry_type(entry.attr),
                 name: &child.name,
@@ -1251,8 +1251,12 @@ mod tests {
             .unwrap();
         let handle = handle.expect("passthrough directories use handles");
         let mut names = Vec::new();
-        fs.readdirplus(ctx, fuse::ROOT_ID, handle, 4096, 0, |dir_entry, _| {
-            names.push(String::from_utf8(dir_entry.name.to_vec()).unwrap());
+        fs.readdirplus(ctx, fuse::ROOT_ID, handle, 4096, 0, |dir_entry, entry| {
+            let name = String::from_utf8(dir_entry.name.to_vec()).unwrap();
+            if name == "preexisting" {
+                assert_eq!(dir_entry.ino, entry.attr.st_ino);
+            }
+            names.push(name);
             Ok(1)
         })
         .unwrap();
