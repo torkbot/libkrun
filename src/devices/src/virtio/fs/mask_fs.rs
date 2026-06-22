@@ -1188,3 +1188,102 @@ fn storage_path(storage: &str, components: &[Vec<u8>]) -> PathBuf {
     }
     path
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct TempTree {
+        path: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "krun-mask-fs-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn context() -> Context {
+        Context {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            pid: 0,
+        }
+    }
+
+    #[test]
+    fn writable_masks_hide_lower_lookups_and_create_in_storage() {
+        let source = TempTree::new("source");
+        let storage = TempTree::new("storage");
+        fs::create_dir(source.path.join("node_modules")).unwrap();
+        fs::write(source.path.join("node_modules").join("lower.txt"), "lower").unwrap();
+        fs::write(source.path.join("preexisting"), "lower").unwrap();
+        fs::write(storage.path.join("preexisting"), "upper-preexisting").unwrap();
+
+        let inode_alloc = Arc::new(InodeAllocator::new());
+        let lower = PassthroughFs::new(
+            passthrough::Config {
+                root_dir: source.path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            inode_alloc.clone(),
+        )
+        .unwrap();
+        let fs = MaskFs::new(
+            lower,
+            MaskConfig {
+                paths: vec!["/node_modules".to_string(), "/preexisting".to_string()],
+                storage: Some(storage.path.to_string_lossy().into_owned()),
+            },
+            inode_alloc,
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let ctx = context();
+        let preexisting = CString::new("preexisting").unwrap();
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, &preexisting).unwrap();
+        assert_eq!(entry.attr.st_size, "upper-preexisting".len() as i64);
+
+        let node_modules = CString::new("node_modules").unwrap();
+        let err = match fs.lookup(ctx, fuse::ROOT_ID, &node_modules) {
+            Ok(_) => panic!("masked lower directory was visible"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+
+        let (entry, _, _) = fs
+            .create(
+                ctx,
+                fuse::ROOT_ID,
+                &node_modules,
+                libc::S_IFREG as u32 | 0o644,
+                false,
+                libc::O_CREAT as u32 | libc::O_WRONLY as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(entry.attr.st_size, 0);
+        assert!(storage.path.join("node_modules").is_file());
+        assert!(source.path.join("node_modules").is_dir());
+    }
+}
