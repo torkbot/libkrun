@@ -3,6 +3,8 @@ use crossbeam_channel::Sender;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -171,6 +173,7 @@ impl FsWorker {
                 virtual_entries,
                 mask: Some(mask),
             } => {
+                let mask = configured_mask(mask, &config.root_dir)?;
                 let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFsRo::new(config, inode_alloc.clone())?;
                 let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
@@ -199,6 +202,7 @@ impl FsWorker {
                 mask: Some(mask),
                 ..
             } => {
+                let mask = configured_mask(mask, &config.root_dir)?;
                 let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFs::new(config, inode_alloc.clone())?;
                 let inner = MaskFs::new(lower, mask, inode_alloc.clone())?;
@@ -362,6 +366,26 @@ fn uncached_masked_passthrough_config(mut config: passthrough::Config) -> passth
     config
 }
 
+fn configured_mask(mut mask: MaskConfig, root_dir: &str) -> io::Result<MaskConfig> {
+    mask.case_insensitive = host_path_is_case_insensitive(root_dir)?;
+    Ok(mask)
+}
+
+#[cfg(target_os = "macos")]
+fn host_path_is_case_insensitive(path: &str) -> io::Result<bool> {
+    let path = CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let result = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result == 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_path_is_case_insensitive(_path: &str) -> io::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +400,21 @@ mod tests {
         assert_eq!(config.root_dir, "/mask-lower");
         assert_eq!(config.entry_timeout, Duration::ZERO);
         assert_eq!(config.attr_timeout, Duration::ZERO);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn configured_mask_uses_case_sensitive_matching_by_default() {
+        let mask = configured_mask(
+            MaskConfig {
+                paths: vec!["/.git".to_string()],
+                storage: None,
+                case_insensitive: true,
+            },
+            "/unused",
+        )
+        .unwrap();
+
+        assert!(!mask.case_insensitive);
     }
 }

@@ -33,6 +33,7 @@ const SYNTHETIC_READDIR_OFFSET: u64 = 1 << 63;
 pub struct MaskConfig {
     pub paths: Vec<String>,
     pub storage: Option<String>,
+    pub case_insensitive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +58,7 @@ struct MaskChild {
 struct MaskSet {
     paths: Vec<Vec<Vec<u8>>>,
     children_by_parent: HashMap<Vec<u8>, Vec<MaskChild>>,
+    case_insensitive: bool,
 }
 
 pub struct MaskFs<L> {
@@ -68,7 +70,7 @@ pub struct MaskFs<L> {
 }
 
 impl MaskSet {
-    fn new(paths: Vec<String>) -> Self {
+    fn new(paths: Vec<String>, case_insensitive: bool) -> Self {
         let paths = paths
             .into_iter()
             .map(|path| {
@@ -94,11 +96,14 @@ impl MaskSet {
         Self {
             paths,
             children_by_parent,
+            case_insensitive,
         }
     }
 
     fn is_masked(&self, path: &[Vec<u8>]) -> bool {
-        self.paths.iter().any(|mask| path_starts_with(path, mask))
+        self.paths
+            .iter()
+            .any(|mask| path_starts_with(path, mask, self.case_insensitive))
     }
 
     fn direct_children(&self, parent: &[Vec<u8>]) -> &[MaskChild] {
@@ -109,15 +114,19 @@ impl MaskSet {
     }
 
     fn is_direct_child(&self, parent: &[Vec<u8>], name: &[u8]) -> bool {
-        self.direct_children(parent)
-            .iter()
-            .any(|child| child.name == name)
+        self.direct_children(parent).iter().any(|child| {
+            if self.case_insensitive {
+                child.name.eq_ignore_ascii_case(name)
+            } else {
+                child.name == name
+            }
+        })
     }
 }
 
 impl<L: FileSystem<Inode = Inode, Handle = Handle>> MaskFs<L> {
     pub fn new(lower: L, config: MaskConfig, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
-        let masks = MaskSet::new(config.paths);
+        let masks = MaskSet::new(config.paths, config.case_insensitive);
         let upper = if let Some(storage) = config.storage {
             std::fs::create_dir_all(&storage)?;
             for path in &masks.paths {
@@ -1164,13 +1173,16 @@ fn path_key(path: &[Vec<u8>]) -> Vec<u8> {
     key
 }
 
-fn path_starts_with(path: &[Vec<u8>], prefix: &[Vec<u8>]) -> bool {
+fn path_starts_with(path: &[Vec<u8>], prefix: &[Vec<u8>], case_insensitive: bool) -> bool {
     !prefix.is_empty()
         && path.len() >= prefix.len()
-        && path
-            .iter()
-            .zip(prefix.iter())
-            .all(|(left, right)| left == right)
+        && path.iter().zip(prefix.iter()).all(|(left, right)| {
+            if case_insensitive {
+                left.eq_ignore_ascii_case(right)
+            } else {
+                left == right
+            }
+        })
 }
 
 fn storage_path(storage: &str, components: &[Vec<u8>]) -> PathBuf {
@@ -1240,6 +1252,7 @@ mod tests {
             MaskConfig {
                 paths: vec!["/node_modules".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
+                case_insensitive: false,
             },
             inode_alloc,
         )
@@ -1276,6 +1289,7 @@ mod tests {
             MaskConfig {
                 paths: vec!["/node_modules".to_string(), "/preexisting".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
+                case_insensitive: false,
             },
             inode_alloc,
         )
@@ -1332,5 +1346,57 @@ mod tests {
         assert_eq!(entry.attr_timeout, Duration::ZERO);
         assert!(storage.path.join("node_modules").is_file());
         assert!(source.path.join("node_modules").is_dir());
+    }
+
+    #[test]
+    fn case_insensitive_masks_route_alternate_casing_to_upper() {
+        let source = TempTree::new("source");
+        let storage = TempTree::new("storage");
+        fs::create_dir(source.path.join(".git")).unwrap();
+
+        let inode_alloc = Arc::new(InodeAllocator::new());
+        let lower = PassthroughFs::new(
+            passthrough::Config {
+                root_dir: source.path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            inode_alloc.clone(),
+        )
+        .unwrap();
+        let fs = MaskFs::new(
+            lower,
+            MaskConfig {
+                paths: vec!["/.git".to_string()],
+                storage: Some(storage.path.to_string_lossy().into_owned()),
+                case_insensitive: true,
+            },
+            inode_alloc,
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let ctx = context();
+        let git = CString::new(".GIT").unwrap();
+        let err = match fs.lookup(ctx, fuse::ROOT_ID, &git) {
+            Ok(_) => panic!("alternate casing reached the lower masked directory"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+
+        let (entry, _, _) = fs
+            .create(
+                ctx,
+                fuse::ROOT_ID,
+                &git,
+                libc::S_IFREG as u32 | 0o644,
+                false,
+                libc::O_CREAT as u32 | libc::O_WRONLY as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(entry.attr.st_size, 0);
+        assert!(storage.path.join(".GIT").is_file());
+        assert!(source.path.join(".git").is_dir());
     }
 }
