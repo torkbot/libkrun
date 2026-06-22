@@ -84,7 +84,7 @@ impl MaskSet {
         for path in &paths {
             if let Some((name, parent)) = path.split_last() {
                 children_by_parent
-                    .entry(path_key(parent))
+                    .entry(mask_path_key(parent, case_insensitive))
                     .or_default()
                     .push(MaskChild {
                         name: name.clone(),
@@ -107,7 +107,7 @@ impl MaskSet {
 
     fn direct_children(&self, parent: &[Vec<u8>]) -> &[MaskChild] {
         self.children_by_parent
-            .get(&path_key(parent))
+            .get(&mask_path_key(parent, self.case_insensitive))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -1177,6 +1177,22 @@ fn path_key(path: &[Vec<u8>]) -> Vec<u8> {
     key
 }
 
+fn mask_path_key(path: &[Vec<u8>], case_insensitive: bool) -> Vec<u8> {
+    if !case_insensitive {
+        return path_key(path);
+    }
+    let normalized = path
+        .iter()
+        .map(|component| {
+            component
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    path_key(&normalized)
+}
+
 fn path_starts_with(path: &[Vec<u8>], prefix: &[Vec<u8>], case_insensitive: bool) -> bool {
     !prefix.is_empty()
         && path.len() >= prefix.len()
@@ -1267,6 +1283,14 @@ mod tests {
             .unwrap();
         assert!(!opts.contains(FsOptions::DO_READDIRPLUS));
         assert!(!opts.contains(FsOptions::READDIRPLUS_AUTO));
+    }
+
+    #[test]
+    fn case_insensitive_masks_match_parent_keys() {
+        let masks = MaskSet::new(vec!["/Packages/A/node_modules".to_string()], true);
+        let parent = vec![b"packages".to_vec(), b"a".to_vec()];
+        assert!(masks.is_direct_child(&parent, b"node_modules"));
+        assert_eq!(masks.direct_children(&parent).len(), 1);
     }
 
     #[test]
