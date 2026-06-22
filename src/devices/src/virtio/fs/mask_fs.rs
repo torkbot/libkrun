@@ -838,7 +838,6 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
         let mut current_offset = offset;
         loop {
             let mut callbacks = 0usize;
-            let mut visible = 0usize;
             let mut stopped = false;
             let mut last_offset = current_offset;
             self.lower
@@ -848,7 +847,6 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
                     if self.masks.is_direct_child(&route.path, dir_entry.name) {
                         return Ok(1);
                     }
-                    visible += 1;
                     let result = add_entry(dir_entry)?;
                     if result == 0 {
                         stopped = true;
@@ -860,9 +858,6 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
             }
             if callbacks == 0 {
                 break;
-            }
-            if visible > 0 {
-                return Ok(());
             }
             current_offset = last_offset;
         }
@@ -895,7 +890,6 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
         let mut current_offset = offset;
         loop {
             let mut callbacks = 0usize;
-            let mut visible = 0usize;
             let mut stopped = false;
             let mut last_offset = current_offset;
             self.lower
@@ -911,7 +905,6 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
                     let mut child_path = route.path.clone();
                     child_path.push(dir_entry.name.to_vec());
                     self.record_entry(Backend::Lower, child_path, &entry);
-                    visible += 1;
                     let result = add_entry(dir_entry, entry)?;
                     if result == 0 {
                         stopped = true;
@@ -923,9 +916,6 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for MaskFs<L> {
             }
             if callbacks == 0 {
                 break;
-            }
-            if visible > 0 {
-                return Ok(());
             }
             current_offset = last_offset;
         }
@@ -1231,6 +1221,7 @@ mod tests {
         let storage = TempTree::new("storage");
         fs::create_dir(source.path.join("node_modules")).unwrap();
         fs::write(source.path.join("node_modules").join("lower.txt"), "lower").unwrap();
+        fs::write(source.path.join("visible"), "visible").unwrap();
         fs::write(source.path.join("preexisting"), "lower").unwrap();
         fs::write(storage.path.join("preexisting"), "upper-preexisting").unwrap();
 
@@ -1266,7 +1257,9 @@ mod tests {
         })
         .unwrap();
         fs.releasedir(ctx, fuse::ROOT_ID, 0, handle).unwrap();
-        assert_eq!(names, vec!["preexisting"]);
+        assert!(names.contains(&"visible".to_string()));
+        assert!(names.contains(&"preexisting".to_string()));
+        assert!(!names.contains(&"node_modules".to_string()));
 
         let preexisting = CString::new("preexisting").unwrap();
         let entry = fs.lookup(ctx, fuse::ROOT_ID, &preexisting).unwrap();
