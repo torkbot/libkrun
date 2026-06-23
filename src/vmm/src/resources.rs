@@ -23,9 +23,10 @@ use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(feature = "tee"))]
 use crate::vmm_config::fs::*;
-#[cfg(feature = "tee")]
-use crate::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle, QbootBundleError};
+use crate::vmm_config::kernel_bundle::InitrdBundle;
 use crate::vmm_config::kernel_bundle::{KernelBundle, KernelBundleError};
+#[cfg(feature = "tee")]
+use crate::vmm_config::kernel_bundle::{QbootBundle, QbootBundleError};
 use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfigError};
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
@@ -189,7 +190,6 @@ pub struct VmResources {
     #[cfg(feature = "tee")]
     pub qboot_bundle: Option<QbootBundle>,
     /// The parameters for the initrd bundle to be loaded in this microVM.
-    #[cfg(feature = "tee")]
     pub initrd_bundle: Option<InitrdBundle>,
     /// The fs device.
     #[cfg(not(feature = "tee"))]
@@ -351,13 +351,17 @@ impl VmResources {
         Ok(())
     }
 
-    #[cfg(feature = "tee")]
     pub fn initrd_bundle(&self) -> Option<&InitrdBundle> {
         self.initrd_bundle.as_ref()
     }
 
-    #[cfg(feature = "tee")]
     pub fn set_initrd_bundle(&mut self, initrd_bundle: InitrdBundle) -> Result<KernelBundleError> {
+        if initrd_bundle.host_addr == 0 {
+            return Err(KernelBundleError::InvalidHostAddress);
+        }
+        if initrd_bundle.size == 0 {
+            return Err(KernelBundleError::InvalidSize);
+        }
         self.initrd_bundle = Some(initrd_bundle);
         Ok(())
     }
@@ -445,6 +449,7 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
+            initrd_bundle: Default::default(),
             fs: Default::default(),
             vsock: Default::default(),
             #[cfg(feature = "blk")]

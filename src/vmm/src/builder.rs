@@ -1393,10 +1393,11 @@ fn load_payload(
             guest_mem
                 .write(kernel_data, GuestAddress(kernel_guest_addr))
                 .unwrap();
+            let initrd_config = load_initrd_bundle(_vm_resources, &guest_mem, _arch_mem_info)?;
             Ok(LoadedPayload {
                 guest_mem,
                 entry_addr: GuestAddress(kernel_entry_addr),
-                initrd_config: None,
+                initrd_config,
                 kernel_cmdline: None,
                 pvh: false,
             })
@@ -1490,6 +1491,7 @@ fn load_payload(
                 }
             };
 
+            let initrd_config = load_initrd_bundle(_vm_resources, &guest_mem, _arch_mem_info)?;
             Ok(LoadedPayload {
                 guest_mem: guest_mem
                     .insert_region(Arc::new(
@@ -1502,7 +1504,7 @@ fn load_payload(
                     ))
                     .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?,
                 entry_addr: GuestAddress(kernel_entry_addr),
-                initrd_config: None,
+                initrd_config,
                 kernel_cmdline: None,
                 pvh: false,
             })
@@ -1589,6 +1591,29 @@ fn load_payload(
             pvh: false,
         }),
     }
+}
+
+fn load_initrd_bundle(
+    vm_resources: &VmResources,
+    guest_mem: &GuestMemoryMmap,
+    arch_mem_info: &ArchMemoryInfo,
+) -> std::result::Result<Option<InitrdConfig>, StartMicrovmError> {
+    let Some(initrd_bundle) = &vm_resources.initrd_bundle else {
+        return Ok(None);
+    };
+    if initrd_bundle.host_addr == 0 || initrd_bundle.size == 0 {
+        return Err(StartMicrovmError::InitrdLoad);
+    }
+    let initrd_data = unsafe {
+        std::slice::from_raw_parts(initrd_bundle.host_addr as *mut u8, initrd_bundle.size)
+    };
+    guest_mem
+        .write(initrd_data, GuestAddress(arch_mem_info.initrd_addr))
+        .map_err(|_| StartMicrovmError::InitrdLoad)?;
+    Ok(Some(InitrdConfig {
+        address: GuestAddress(arch_mem_info.initrd_addr),
+        size: initrd_data.len(),
+    }))
 }
 
 pub struct PayloadConfig {

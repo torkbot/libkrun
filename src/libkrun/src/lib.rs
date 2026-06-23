@@ -66,9 +66,10 @@ use vmm::vmm_config::firmware::FirmwareConfig;
 pub use vmm::vmm_config::fs::FsPassthroughMaskConfig;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vmm::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig};
+use vmm::vmm_config::kernel_bundle::InitrdBundle;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
-use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
+use vmm::vmm_config::kernel_bundle::QbootBundle;
 use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfig};
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
@@ -2358,6 +2359,29 @@ pub unsafe extern "C" fn krun_set_kernel_bundle_raw(
                 Ok(()) => KRUN_SUCCESS,
                 Err(error) => {
                     error!("Invalid kernel bundle: {error}");
+                    -libc::EINVAL
+                }
+            }
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_initrd_bundle_raw(
+    ctx_id: u32,
+    host_addr: u64,
+    size: usize,
+) -> i32 {
+    let initrd_bundle = InitrdBundle { host_addr, size };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            match ctx_cfg.get_mut().vmr.set_initrd_bundle(initrd_bundle) {
+                Ok(()) => KRUN_SUCCESS,
+                Err(error) => {
+                    error!("Invalid initrd bundle: {error}");
                     -libc::EINVAL
                 }
             }

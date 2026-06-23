@@ -818,6 +818,26 @@ int32_t krun_set_kernel(uint32_t ctx_id,
                         const char *cmdline);
 
 /**
+ * Sets a process-resident kernel bundle to be loaded in the microVM.
+ *
+ * The memory backing `host_addr` must remain valid until the VM has booted.
+ */
+int32_t krun_set_kernel_bundle_raw(uint32_t ctx_id,
+                                   uint64_t host_addr,
+                                   uint64_t guest_addr,
+                                   uint64_t entry_addr,
+                                   size_t size);
+
+/**
+ * Sets a process-resident initrd bundle to be loaded with the configured kernel.
+ *
+ * The memory backing `host_addr` must remain valid until the VM has booted.
+ */
+int32_t krun_set_initrd_bundle_raw(uint32_t ctx_id,
+                                   uint64_t host_addr,
+                                   size_t size);
+
+/**
  * Sets environment variables to be configured in the context of the executable.
  *
  * Arguments:
