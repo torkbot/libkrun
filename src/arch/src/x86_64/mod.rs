@@ -521,6 +521,27 @@ mod tests {
     }
 
     #[test]
+    fn bundled_initrd_is_placed_inside_guest_ram() {
+        let initrd_size = 0x20_0000;
+        let (info, regions) = arch_memory_regions(
+            1usize << 29,
+            Some(KERNEL_LOAD_ADDR),
+            KERNEL_SIZE,
+            initrd_size,
+            None,
+        );
+        assert_eq!(info.ram_last_addr - initrd_size, info.initrd_addr);
+        assert!(
+            regions.iter().any(|(start, size)| {
+                let region_start = start.0;
+                let region_end = region_start + *size as u64;
+                info.initrd_addr >= region_start && info.initrd_addr + initrd_size <= region_end
+            }),
+            "initrd range must be backed by guest RAM",
+        );
+    }
+
+    #[test]
     fn regions_gt_4gb() {
         let (_info, regions) = arch_memory_regions(
             (1usize << 32) + 0x8000,

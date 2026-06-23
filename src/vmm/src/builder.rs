@@ -1616,6 +1616,13 @@ fn load_initrd_bundle(
     }))
 }
 
+fn initrd_bundle_size(vm_resources: &VmResources) -> std::result::Result<u64, StartMicrovmError> {
+    let Some(initrd_bundle) = &vm_resources.initrd_bundle else {
+        return Ok(0);
+    };
+    u64::try_from(initrd_bundle.size).map_err(|_| StartMicrovmError::InitrdLoad)
+}
+
 pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
@@ -1640,6 +1647,7 @@ pub fn create_guest_memory(
     } else {
         (None, None)
     };
+    let initrd_bundle_size = initrd_bundle_size(vm_resources)?;
 
     #[cfg(target_arch = "x86_64")]
     let (arch_mem_info, mut arch_mem_regions) = match payload {
@@ -1651,7 +1659,13 @@ pub fn create_guest_memory(
                 } else {
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
-            arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None)
+            arch::arch_memory_regions(
+                mem_size,
+                Some(kernel_guest_addr),
+                kernel_size,
+                initrd_bundle_size,
+                None,
+            )
         }
         Payload::ExternalKernel(external_kernel) => arch::arch_memory_regions(
             mem_size,
@@ -1668,7 +1682,13 @@ pub fn create_guest_memory(
                 } else {
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
-            arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None)
+            arch::arch_memory_regions(
+                mem_size,
+                Some(kernel_guest_addr),
+                kernel_size,
+                initrd_bundle_size,
+                None,
+            )
         }
         #[cfg(test)]
         Payload::Empty => arch::arch_memory_regions(mem_size, None, 0, 0, None),
@@ -1679,7 +1699,10 @@ pub fn create_guest_memory(
         Payload::ExternalKernel(external_kernel) => {
             arch::arch_memory_regions(mem_size, external_kernel.initramfs_size, None)
         }
-        _ => arch::arch_memory_regions(mem_size, 0, firmware_size),
+        Payload::KernelCopy => arch::arch_memory_regions(mem_size, initrd_bundle_size, None),
+        #[cfg(test)]
+        Payload::Empty => arch::arch_memory_regions(mem_size, 0, None),
+        Payload::Firmware => arch::arch_memory_regions(mem_size, 0, firmware_size),
     };
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
