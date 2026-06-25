@@ -8,12 +8,12 @@ use std::ffi::CString;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::thread;
+use std::time::Duration;
 #[cfg(windows)]
 use utils::windows::AsRawFd;
-use std::time::Duration;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;

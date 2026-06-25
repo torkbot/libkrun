@@ -498,9 +498,9 @@ impl FileSystem for PassthroughFsRo {
 mod tests {
     use std::io;
 
-    use super::{ignore_read_only_flush_error, linux_errno, read_only_open_flags};
     #[cfg(target_os = "windows")]
     use super::windows::fs_utils;
+    use super::{ignore_read_only_flush_error, linux_errno, read_only_open_flags};
 
     #[test]
     fn read_only_open_flags_allow_append() {

@@ -2533,14 +2533,68 @@ pub fn krun_set_direct_block_root(
                 return -libc::EINVAL;
             }
 
-            ctx_cfg.set_direct_cmdline_prolog(format!(
-                "reboot=k panic=-1 panic_print=0 console=hvc0 root={device} rootfstype={fstype} {options} quiet no-kvmapf init={init_path}"
+            ctx_cfg.set_direct_cmdline_prolog(direct_block_root_cmdline_prolog(
+                device,
+                fstype,
+                options,
+                DirectBlockRootInit::Root { init_path },
             ));
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
 
     KRUN_SUCCESS
+}
+
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub fn krun_set_direct_block_root_initrd(
+    ctx_id: u32,
+    device: String,
+    fstype: String,
+    options: String,
+    init_path: String,
+) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let ctx_cfg = ctx_cfg.get_mut();
+            if ctx_cfg.block_cfgs.is_empty() {
+                error!("No block devices configured");
+                return -libc::EINVAL;
+            }
+
+            ctx_cfg.set_direct_cmdline_prolog(direct_block_root_cmdline_prolog(
+                device,
+                fstype,
+                options,
+                DirectBlockRootInit::Initrd { init_path },
+            ));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+enum DirectBlockRootInit {
+    Root { init_path: String },
+    Initrd { init_path: String },
+}
+
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+fn direct_block_root_cmdline_prolog(
+    device: String,
+    fstype: String,
+    options: String,
+    init: DirectBlockRootInit,
+) -> String {
+    let init_arg = match init {
+        DirectBlockRootInit::Root { init_path } => format!("init={init_path}"),
+        DirectBlockRootInit::Initrd { init_path } => format!("rdinit={init_path}"),
+    };
+    format!(
+        "reboot=k panic=-1 panic_print=0 console=hvc0 root={device} rootfstype={fstype} {options} quiet no-kvmapf {init_arg}"
+    )
 }
 
 #[cfg(not(feature = "tee"))]
@@ -2629,11 +2683,10 @@ fn fs_add_overlay_entry(ctx_id: u32, fs_tag: &str, path: &str, entry: VirtualEnt
                 | FsDeviceBackend::Null { virtual_entries } => virtual_entries,
                 FsDeviceBackend::Virtual { .. } => return -libc::ENOTSUP,
             };
-            let (parent_children, name) =
-                match resolve_overlay_path(virtual_entries, path) {
-                    Ok(v) => v,
-                    Err(e) => return e,
-                };
+            let (parent_children, name) = match resolve_overlay_path(virtual_entries, path) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
             parent_children.push(VirtualDirEntry { name, entry });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -3363,5 +3416,42 @@ mod test_disable_implicit_init {
         drop(ctx_map);
 
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(all(test, feature = "blk", not(feature = "tee")))]
+mod test_direct_block_root_cmdline {
+    use super::*;
+
+    #[test]
+    fn direct_block_root_can_boot_through_rootfs_init() {
+        let prolog = direct_block_root_cmdline_prolog(
+            "/dev/vda".to_string(),
+            "ext4".to_string(),
+            "ro".to_string(),
+            DirectBlockRootInit::Root {
+                init_path: "/sandbox-init".to_string(),
+            },
+        );
+
+        assert!(prolog.contains(" root=/dev/vda "));
+        assert!(prolog.contains(" init=/sandbox-init"));
+        assert!(!prolog.contains(" rdinit=/sandbox-init"));
+    }
+
+    #[test]
+    fn direct_block_root_can_boot_through_initramfs_init() {
+        let prolog = direct_block_root_cmdline_prolog(
+            "/dev/vda".to_string(),
+            "ext4".to_string(),
+            "ro".to_string(),
+            DirectBlockRootInit::Initrd {
+                init_path: "/init".to_string(),
+            },
+        );
+
+        assert!(prolog.contains(" root=/dev/vda "));
+        assert!(prolog.contains(" rdinit=/init"));
+        assert!(!prolog.contains(" init=/init"));
     }
 }

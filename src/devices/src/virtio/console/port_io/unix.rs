@@ -9,11 +9,11 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use vm_memory::bitmap::Bitmap;
 use vm_memory::VolatileSlice;
+use vm_memory::bitmap::Bitmap;
 
-use crate::virtio::file_traits::FileReadWriteVolatile;
 use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties};
+use crate::virtio::file_traits::FileReadWriteVolatile;
 
 pub fn stdin() -> Result<Box<dyn PortInput + Send>, nix::Error> {
     let fd = dup_raw_fd_into_owned(STDIN_FILENO)?;

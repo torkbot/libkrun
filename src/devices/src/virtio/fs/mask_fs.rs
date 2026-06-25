@@ -4,9 +4,9 @@ use std::hash::Hash;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicI32;
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
