@@ -2516,6 +2516,11 @@ fn create_explicit_ports(
 
     for port_cfg in port_configs {
         let port_desc = match port_cfg {
+            PortConfig::ConsoleOutput { output_fd } => PortDescription::console(
+                Some(port_io::input_empty().unwrap()),
+                Some(port_io::output_to_raw_fd_dup(*output_fd).unwrap()),
+                port_io::term_fixed_size(0, 0),
+            ),
             PortConfig::Tty { name, tty_fd } => {
                 assert!(*tty_fd > 0, "PortConfig::Tty must have a valid tty_fd");
                 let term_fd = unsafe { BorrowedFd::borrow_raw(*tty_fd) };

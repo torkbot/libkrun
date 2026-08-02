@@ -2865,6 +2865,28 @@ pub unsafe extern "C" fn krun_add_virtio_console_default(
     KRUN_SUCCESS
 }
 
+#[cfg(unix)]
+pub fn krun_add_console_output_fd(ctx_id: u32, output_fd: RawFd) -> i32 {
+    if output_fd < 0 {
+        return -libc::EINVAL;
+    }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg
+                .get_mut()
+                .vmr
+                .virtio_consoles
+                .push(VirtioConsoleConfigMode::Explicit(vec![
+                    PortConfig::ConsoleOutput { output_fd },
+                ]));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[cfg(target_os = "windows")]
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]

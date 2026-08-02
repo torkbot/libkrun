@@ -138,6 +138,9 @@ pub enum VirtioConsoleConfigMode {
 
 #[cfg(unix)]
 pub enum PortConfig {
+    ConsoleOutput {
+        output_fd: RawFd,
+    },
     Tty {
         name: String,
         tty_fd: RawFd,
