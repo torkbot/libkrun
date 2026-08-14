@@ -3422,7 +3422,7 @@ mod test_disable_implicit_init {
 
     #[test]
     fn test_disable_implicit_init() {
-        let ctx = unsafe { krun_create_ctx() } as u32;
+        let ctx = krun_create_ctx() as u32;
         unsafe {
             krun_disable_implicit_init(ctx);
             krun_add_virtiofs3(ctx, c"/dev/root".as_ptr(), c"/tmp".as_ptr(), 0, false);
@@ -3431,8 +3431,14 @@ mod test_disable_implicit_init {
         let ctx_map = CTX_MAP.lock().unwrap();
         let cfg = ctx_map.get(&ctx).unwrap();
         assert_eq!(cfg.vmr.fs.len(), 1);
+        let FsDeviceBackend::Passthrough {
+            virtual_entries, ..
+        } = &cfg.vmr.fs[0].backend
+        else {
+            panic!("root virtiofs should use the passthrough backend");
+        };
         assert!(
-            cfg.vmr.fs[0].virtual_entries.is_empty(),
+            virtual_entries.is_empty(),
             "root virtiofs should not inject init.krun after krun_disable_implicit_init()"
         );
         drop(ctx_map);
