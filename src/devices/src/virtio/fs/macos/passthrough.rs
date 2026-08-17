@@ -24,7 +24,7 @@ use utils::worker_message::WorkerMessage;
 
 use crate::virtio::fs::filesystem::SecContext;
 
-use super::super::super::linux_errno::{LINUX_ERANGE, linux_error};
+use super::super::super::linux_errno::{LINUX_EOPNOTSUPP, LINUX_ERANGE, linux_error};
 use super::super::bindings;
 use super::super::filesystem::{
     Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
@@ -33,6 +33,17 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
+pub use super::sandbox_metadata::IdentityMapping;
+use super::sandbox_metadata::{
+    GuestMetadata, NameError, OVERFLOW_ID, XATTR_NAME_C, guest_name_from_carrier,
+    user_xattr_host_name, validate_capability,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct SandboxConfig {
+    pub identity: IdentityMapping,
+    pub xattrs_enabled: bool,
+}
 
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
@@ -376,6 +387,331 @@ fn set_host_stat(
     Ok(())
 }
 
+fn sandbox_xattr_options(st: bindings::stat64) -> i32 {
+    if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        libc::XATTR_NOFOLLOW
+    } else {
+        0
+    }
+}
+
+fn sandbox_xattr_options_for_handle(file: &InodeHandle, st: bindings::stat64) -> i32 {
+    match file {
+        InodeHandle::Path(_) => sandbox_xattr_options(st),
+        // An fd already identifies the symlink itself when opened with
+        // O_SYMLINK; XATTR_NOFOLLOW is a pathname-only option on macOS.
+        InodeHandle::Fd(_) => 0,
+    }
+}
+
+fn read_sandbox_metadata(
+    file: &InodeHandle,
+    st: bindings::stat64,
+) -> io::Result<Option<GuestMetadata>> {
+    // Attribute-not-found is the only state that means "native". In
+    // particular, malformed or unreadable adopted metadata must never fall
+    // back to host stat and silently change the guest's authority view.
+    let options = sandbox_xattr_options_for_handle(file, st);
+    loop {
+        let size = match file {
+            InodeHandle::Path(path) => unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    XATTR_NAME_C.as_ptr().cast(),
+                    null_mut(),
+                    0,
+                    0,
+                    options,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::fgetxattr(*fd, XATTR_NAME_C.as_ptr().cast(), null_mut(), 0, 0, options)
+            },
+        };
+        if size < 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ENOATTR) {
+                Ok(None)
+            } else {
+                Err(linux_error(error))
+            };
+        }
+
+        let mut value = vec![0; size as usize];
+        let read = match file {
+            InodeHandle::Path(path) => unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    XATTR_NAME_C.as_ptr().cast(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    options,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::fgetxattr(
+                    *fd,
+                    XATTR_NAME_C.as_ptr().cast(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    options,
+                )
+            },
+        };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ERANGE) => continue,
+                Some(libc::ENOATTR) => return Ok(None),
+                _ => return Err(linux_error(error)),
+            }
+        }
+        value.truncate(read as usize);
+        let metadata = GuestMetadata::parse(&value).map_err(|_| einval())?;
+        if !metadata.matches_file_kind(st.st_mode as u32) {
+            return Err(einval());
+        }
+        return Ok(Some(metadata));
+    }
+}
+
+fn read_sandbox_metadata_for_config(
+    file: &InodeHandle,
+    st: bindings::stat64,
+    config: SandboxConfig,
+) -> io::Result<Option<GuestMetadata>> {
+    match read_sandbox_metadata(file, st) {
+        Err(error) if !config.xattrs_enabled && error.raw_os_error() == Some(LINUX_EOPNOTSUPP) => {
+            // Native-only mode is selected only for a backing volume that
+            // reports no xattr support. Still attempt the read so an adopted
+            // record can never be silently ignored if a caller supplies a
+            // stale or incorrect capability result.
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+fn write_sandbox_metadata(
+    file: &InodeHandle,
+    st: bindings::stat64,
+    metadata: &GuestMetadata,
+) -> io::Result<()> {
+    if !metadata.matches_file_kind(st.st_mode as u32) {
+        return Err(einval());
+    }
+    let value = metadata.encode();
+    let options = sandbox_xattr_options_for_handle(file, st);
+    let result = match file {
+        InodeHandle::Path(path) => unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                XATTR_NAME_C.as_ptr().cast(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                options,
+            )
+        },
+        InodeHandle::Fd(fd) => unsafe {
+            libc::fsetxattr(
+                *fd,
+                XATTR_NAME_C.as_ptr().cast(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                options,
+            )
+        },
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(linux_error(io::Error::last_os_error()))
+    }
+}
+
+fn set_sandbox_stat(
+    ctx: &Context,
+    config: SandboxConfig,
+    file: &InodeHandle,
+    host_st: Option<bindings::stat64>,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    update_sandbox_metadata(ctx, config, file, host_st, owner, mode, false, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_sandbox_metadata(
+    ctx: &Context,
+    config: SandboxConfig,
+    file: &InodeHandle,
+    host_st: Option<bindings::stat64>,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+    clear_capability: bool,
+    clear_mode_privileges: bool,
+    persist_unchanged_metadata: bool,
+) -> io::Result<()> {
+    // Fs currently dispatches one request queue through one synchronous
+    // worker. That serialization makes this read-modify-replace operation a
+    // POSIX-ordered metadata transition. If dispatch becomes parallel, the
+    // worker boundary must add same-inode serialization before this remains
+    // safe; a second lock here would only duplicate the current owner.
+    let mapping = config.identity;
+    let host_st = host_st.unwrap_or(istat(
+        ctx,
+        PermissionSemantics::Sandbox(config),
+        file,
+        true,
+    )?);
+    let existing = read_sandbox_metadata_for_config(file, host_st, config)?;
+    let mut metadata = existing.clone().unwrap_or_else(|| {
+        GuestMetadata::from_native(
+            mapping,
+            host_st.st_uid,
+            host_st.st_gid,
+            host_st.st_mode as u32,
+        )
+    });
+    let original = metadata.clone();
+    if let Some((uid, gid)) = owner {
+        if uid != u32::MAX {
+            metadata.uid = uid;
+        }
+        if gid != u32::MAX {
+            metadata.gid = gid;
+        }
+    }
+    if let Some(mode) = mode {
+        let requested_kind = mode & libc::S_IFMT as u32;
+        let current_kind = metadata.mode & libc::S_IFMT as u32;
+        if requested_kind != 0 && requested_kind != current_kind {
+            return Err(einval());
+        }
+        metadata.mode = current_kind | (mode & !(libc::S_IFMT as u32));
+    }
+    if clear_capability {
+        metadata.capability = None;
+    }
+    if clear_mode_privileges {
+        metadata.mode = clear_suid_sgid(metadata.mode);
+    }
+    if existing.is_none()
+        && metadata == original
+        && (!persist_unchanged_metadata || !config.xattrs_enabled)
+    {
+        return Ok(());
+    }
+    if !config.xattrs_enabled && existing.is_none() {
+        // Native-only entries remain writable while no guest metadata must
+        // change, but a transition that needs an authority record fails
+        // closed instead of mutating host ownership or mode.
+        return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+    }
+    write_sandbox_metadata(file, host_st, &metadata)
+}
+
+fn prepare_sandbox_content_mutation(
+    ctx: &Context,
+    config: SandboxConfig,
+    file: &InodeHandle,
+    clear_mode_privileges: bool,
+) -> io::Result<()> {
+    // HANDLE_KILLPRIV_V2 requires capabilities to be cleared for every write
+    // or truncate. The request flag controls only whether setuid/setgid must
+    // also be cleared.
+    update_sandbox_metadata(
+        ctx,
+        config,
+        file,
+        None,
+        None,
+        None,
+        true,
+        clear_mode_privileges,
+        false,
+    )
+}
+
+fn open_sandbox_create(path: &CStr, flags: i32, mode: u32) -> io::Result<(RawFd, bool)> {
+    let caller_requested_exclusive = flags & libc::O_EXCL != 0;
+    let base_flags = (flags & !(libc::O_CREAT | libc::O_EXCL)) | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+
+    if caller_requested_exclusive {
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                base_flags | libc::O_CREAT | libc::O_EXCL,
+                mode,
+            )
+        };
+        return if fd >= 0 {
+            Ok((fd, true))
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        };
+    }
+
+    loop {
+        // The exclusive attempt tells us whether this request created the
+        // inode, so only a newly created file receives creation metadata.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                base_flags | libc::O_CREAT | libc::O_EXCL,
+                mode,
+            )
+        };
+        if fd >= 0 {
+            return Ok((fd, true));
+        }
+        let create_error = io::Error::last_os_error();
+        if create_error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(linux_error(create_error));
+        }
+
+        // FUSE may issue CREATE from a cached negative lookup even if a host
+        // actor populated the path in the meantime. POSIX O_CREAT without
+        // O_EXCL opens that inode. If it disappears between these two calls,
+        // retry until one side of the race wins.
+        let fd = unsafe { libc::open(path.as_ptr(), base_flags, mode) };
+        if fd >= 0 {
+            return Ok((fd, false));
+        }
+        let open_error = io::Error::last_os_error();
+        if open_error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(linux_error(open_error));
+        }
+    }
+}
+
+fn apply_sandbox_stat(
+    st: &mut bindings::stat64,
+    mapping: IdentityMapping,
+    metadata: Option<GuestMetadata>,
+) -> io::Result<bindings::stat64> {
+    if let Some(metadata) = metadata {
+        st.st_uid = metadata.uid;
+        st.st_gid = metadata.gid;
+        st.st_mode = metadata.mode as u16;
+    } else {
+        let kind = st.st_mode as u32 & libc::S_IFMT as u32;
+        if kind != libc::S_IFREG as u32
+            && kind != libc::S_IFDIR as u32
+            && kind != libc::S_IFLNK as u32
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
+        st.st_uid = mapping.guest_uid_for(st.st_uid);
+        st.st_gid = mapping.guest_gid_for(st.st_gid);
+    }
+    Ok(*st)
+}
+
 fn set_stat(
     ctx: &Context,
     semantics: PermissionSemantics,
@@ -387,6 +723,9 @@ fn set_stat(
     match semantics {
         PermissionSemantics::LinuxComplete => set_xattr_stat(ctx, file, st, owner, mode),
         PermissionSemantics::LinuxSimplified => set_host_stat(file, owner, mode),
+        PermissionSemantics::Sandbox(config) => {
+            set_sandbox_stat(ctx, config, file, st, owner, mode)
+        }
     }
 }
 
@@ -438,6 +777,11 @@ fn fstat(
                     st.st_gid = ctx.gid;
                     Ok(st)
                 }
+                PermissionSemantics::Sandbox(config) => {
+                    let metadata =
+                        read_sandbox_metadata_for_config(&InodeHandle::Fd(fd), st, config)?;
+                    apply_sandbox_stat(&mut st, config.identity, metadata)
+                }
             }
         } else {
             Ok(st)
@@ -447,12 +791,36 @@ fn fstat(
     }
 }
 
+const SANDBOX_STAT_OPEN_FLAGS: i32 =
+    libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_CLOEXEC;
+
+fn open_sandbox_stat(path: &CStr) -> io::Result<File> {
+    // O_EVTONLY avoids requiring file read access, while O_SYMLINK binds the
+    // descriptor to a final symlink instead of following it. O_NONBLOCK keeps
+    // an unsupported host FIFO from stalling the sole filesystem worker
+    // before its kind can be rejected.
+    let fd = unsafe { libc::open(path.as_ptr(), SANDBOX_STAT_OPEN_FLAGS) };
+    if fd < 0 {
+        return Err(linux_error(io::Error::last_os_error()));
+    }
+    // Establish RAII ownership before either fstat or xattr parsing can fail
+    // so every error path closes the descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 fn lstat(
     ctx: &Context,
     semantics: PermissionSemantics,
     c_path: &CString,
     host: bool,
 ) -> io::Result<bindings::stat64> {
+    if !host && let PermissionSemantics::Sandbox(_) = semantics {
+        // Stat and metadata must come from the same vnode: a host actor can
+        // replace a pathname between independent lstat and getxattr calls.
+        let file = open_sandbox_stat(c_path)?;
+        return fstat(ctx, semantics, file.as_raw_fd(), false);
+    }
+
     let mut st = MaybeUninit::<bindings::stat64>::zeroed();
 
     // Safe because the kernel will only write data in `st` and we check the return
@@ -471,6 +839,14 @@ fn lstat(
                     st.st_uid = ctx.uid;
                     st.st_gid = ctx.gid;
                     Ok(st)
+                }
+                PermissionSemantics::Sandbox(config) => {
+                    let metadata = read_sandbox_metadata_for_config(
+                        &InodeHandle::Path(c_path.clone()),
+                        st,
+                        config,
+                    )?;
+                    apply_sandbox_stat(&mut st, config.identity, metadata)
                 }
             }
         } else {
@@ -542,6 +918,11 @@ pub enum PermissionSemantics {
     ///    requesting the operation within the guest (obtained from `Context`).
     ///  - Permissions bits are stored in the host, not as extended attributes.
     LinuxSimplified,
+
+    /// Sandbox host-directory semantics. Native host ownership is translated
+    /// through one VM-scoped mapping and guest-owned metadata is persisted in
+    /// Sandbox's private complete record.
+    Sandbox(SandboxConfig),
 }
 
 /// Options that configure the behavior of the file system.
@@ -650,6 +1031,14 @@ pub struct PassthroughFs {
 
 impl PassthroughFs {
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
+        if let PermissionSemantics::Sandbox(config) = cfg.semantics
+            && (config.identity.guest_uid == OVERFLOW_ID
+                || config.identity.guest_gid == OVERFLOW_ID)
+        {
+            // The fixed overflow identity must remain distinct from the
+            // configured principal or unrelated host owners would alias it.
+            return Err(einval());
+        }
         let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -851,11 +1240,28 @@ impl PassthroughFs {
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         let flags = self.parse_open_flags(flags as i32);
+        let sandbox_truncate = (flags & libc::O_TRUNC) != 0
+            && matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_));
+        let open_flags = if sandbox_truncate {
+            flags & !libc::O_TRUNC
+        } else {
+            flags
+        };
+        let file = RwLock::new(self.open_inode(inode, open_flags)?);
 
-        let file = RwLock::new(self.open_inode(inode, flags)?);
+        if sandbox_truncate && let PermissionSemantics::Sandbox(config) = self.cfg.semantics {
+            let fd = file.read().unwrap().as_raw_fd();
+            prepare_sandbox_content_mutation(ctx, config, &InodeHandle::Fd(fd), kill_priv)?;
+            if unsafe { libc::ftruncate(fd, 0) } < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+        }
 
         // If O_TRUNC and kill_priv (OPEN_KILL_SUIDGID), clear security.capability and suid/sgid
-        if (flags & libc::O_TRUNC) != 0 && kill_priv {
+        if (flags & libc::O_TRUNC) != 0
+            && kill_priv
+            && !matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+        {
             let fd = file.read().unwrap().as_raw_fd();
             let ihandle = InodeHandle::Fd(fd);
 
@@ -1119,10 +1525,398 @@ impl PassthroughFs {
 
         // Set security context
         if let Some(secctx) = extensions.secctx {
-            let ihandle = InodeHandle::Path(c_path);
+            let ihandle = InodeHandle::Path(c_path.clone());
             set_secctx(&ihandle, secctx, false)?
         };
         self.lookup(ctx, parent, name)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mknod_sandbox(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let kind = mode & libc::S_IFMT as u32;
+        if kind != 0 && kind != libc::S_IFREG as u32 {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
+        if extensions.secctx.is_some() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
+
+        let c_path = self.name_to_path(parent, name)?;
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let ihandle = InodeHandle::Fd(fd);
+        let guest_mode = libc::S_IFREG as u32 | (mode & !(umask & 0o777));
+        if let Err(error) = set_stat(
+            &ctx,
+            self.cfg.semantics,
+            &ihandle,
+            None,
+            Some((ctx.uid, ctx.gid)),
+            Some(guest_mode),
+        ) {
+            unsafe { libc::close(fd) };
+            // A pathname cleanup could delete a host replacement installed
+            // after creation. Leave the unadopted entry as a visible host
+            // integrity failure instead of risking unrelated data.
+            warn!(
+                "regular-file metadata attachment failed; a native host entry may remain: {error}"
+            );
+            return Err(error);
+        }
+        unsafe { libc::close(fd) };
+        self.lookup(ctx, parent, name)
+    }
+
+    fn sandbox_inode_metadata(
+        &self,
+        ctx: &Context,
+        mapping: IdentityMapping,
+        inode: Inode,
+    ) -> io::Result<(InodeHandle, bindings::stat64, Option<GuestMetadata>)> {
+        let handle = self.inode_to_handle(inode, true)?;
+        let host_st = istat(
+            ctx,
+            PermissionSemantics::Sandbox(SandboxConfig {
+                identity: mapping,
+                xattrs_enabled: true,
+            }),
+            &handle,
+            true,
+        )?;
+        let metadata = read_sandbox_metadata(&handle, host_st)?;
+        Ok((handle, host_st, metadata))
+    }
+
+    fn sandbox_setxattr(
+        &self,
+        ctx: &Context,
+        mapping: IdentityMapping,
+        inode: Inode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        if name.to_bytes() == &SECURITY_CAPABILITY[..SECURITY_CAPABILITY.len() - 1] {
+            if !validate_capability(value) {
+                return Err(einval());
+            }
+            let (handle, host_st, existing) = self.sandbox_inode_metadata(ctx, mapping, inode)?;
+            let mut metadata = existing.unwrap_or_else(|| {
+                GuestMetadata::from_native(
+                    mapping,
+                    host_st.st_uid,
+                    host_st.st_gid,
+                    host_st.st_mode as u32,
+                )
+            });
+            if flags & bindings::LINUX_XATTR_CREATE as u32 != 0 && metadata.capability.is_some() {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EEXIST)));
+            }
+            if flags & bindings::LINUX_XATTR_REPLACE as u32 != 0 && metadata.capability.is_none() {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::ENODATA)));
+            }
+            metadata.capability = Some(value.to_vec());
+            return write_sandbox_metadata(&handle, host_st, &metadata);
+        }
+
+        let host_name = user_xattr_host_name(name.to_bytes()).map_err(|error| match error {
+            NameError::TooLong => io::Error::from_raw_os_error(LINUX_ERANGE),
+            NameError::UnsupportedNamespace => {
+                linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            }
+        })?;
+        let host_name = CStr::from_bytes_with_nul(&host_name).map_err(|_| einval())?;
+        let mut mac_flags = 0;
+        if flags & bindings::LINUX_XATTR_CREATE as u32 != 0 {
+            mac_flags |= libc::XATTR_CREATE;
+        }
+        if flags & bindings::LINUX_XATTR_REPLACE as u32 != 0 {
+            mac_flags |= libc::XATTR_REPLACE;
+        }
+        let (handle, host_st, _) = self.sandbox_inode_metadata(ctx, mapping, inode)?;
+        let options = sandbox_xattr_options(host_st);
+        let result = match handle {
+            InodeHandle::Path(path) => unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    host_name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    mac_flags | options,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::fsetxattr(
+                    fd,
+                    host_name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    mac_flags | options,
+                )
+            },
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn sandbox_getxattr(
+        &self,
+        ctx: &Context,
+        mapping: IdentityMapping,
+        inode: Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        if name.to_bytes() == &SECURITY_CAPABILITY[..SECURITY_CAPABILITY.len() - 1] {
+            let (_, _, metadata) = self.sandbox_inode_metadata(ctx, mapping, inode)?;
+            let capability = metadata
+                .and_then(|metadata| metadata.capability)
+                .ok_or_else(|| linux_error(io::Error::from_raw_os_error(libc::ENODATA)))?;
+            if size == 0 {
+                return Ok(GetxattrReply::Count(capability.len() as u32));
+            }
+            if capability.len() > size as usize {
+                return Err(io::Error::from_raw_os_error(LINUX_ERANGE));
+            }
+            return Ok(GetxattrReply::Value(capability));
+        }
+
+        let host_name = user_xattr_host_name(name.to_bytes()).map_err(|error| match error {
+            NameError::TooLong => io::Error::from_raw_os_error(LINUX_ERANGE),
+            NameError::UnsupportedNamespace => {
+                linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            }
+        })?;
+        let host_name = CStr::from_bytes_with_nul(&host_name).map_err(|_| einval())?;
+        let (handle, host_st, _) = self.sandbox_inode_metadata(ctx, mapping, inode)?;
+        let options = sandbox_xattr_options(host_st);
+        let mut value = vec![0; size as usize];
+        let result = match handle {
+            InodeHandle::Path(path) => unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    host_name.as_ptr(),
+                    if size == 0 {
+                        null_mut()
+                    } else {
+                        value.as_mut_ptr().cast()
+                    },
+                    value.len(),
+                    0,
+                    options,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::fgetxattr(
+                    fd,
+                    host_name.as_ptr(),
+                    if size == 0 {
+                        null_mut()
+                    } else {
+                        value.as_mut_ptr().cast()
+                    },
+                    value.len(),
+                    0,
+                    options,
+                )
+            },
+        };
+        if result < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        if size == 0 {
+            Ok(GetxattrReply::Count(result as u32))
+        } else {
+            value.truncate(result as usize);
+            Ok(GetxattrReply::Value(value))
+        }
+    }
+
+    fn sandbox_listxattr(
+        &self,
+        ctx: &Context,
+        mapping: IdentityMapping,
+        inode: Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
+        let (handle, host_st, metadata) = self.sandbox_inode_metadata(ctx, mapping, inode)?;
+        let options = sandbox_xattr_options(host_st);
+        let raw = loop {
+            let count = match &handle {
+                InodeHandle::Path(path) => unsafe {
+                    libc::listxattr(path.as_ptr(), null_mut(), 0, options)
+                },
+                InodeHandle::Fd(fd) => unsafe { libc::flistxattr(*fd, null_mut(), 0, options) },
+            };
+            if count < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+            let mut raw = vec![0; count as usize];
+            let read = match &handle {
+                InodeHandle::Path(path) => unsafe {
+                    libc::listxattr(path.as_ptr(), raw.as_mut_ptr().cast(), raw.len(), options)
+                },
+                InodeHandle::Fd(fd) => unsafe {
+                    libc::flistxattr(*fd, raw.as_mut_ptr().cast(), raw.len(), options)
+                },
+            };
+            if read < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ERANGE) {
+                    continue;
+                }
+                return Err(linux_error(error));
+            }
+            raw.truncate(read as usize);
+            break raw;
+        };
+
+        let mut names = Vec::new();
+        for host_name in raw.split(|byte| *byte == 0) {
+            let Some(guest_name) = guest_name_from_carrier(host_name) else {
+                continue;
+            };
+            if !guest_name.starts_with(b"user.") {
+                continue;
+            }
+            names.extend_from_slice(guest_name);
+            names.push(0);
+        }
+        if metadata.and_then(|metadata| metadata.capability).is_some() {
+            names.extend_from_slice(SECURITY_CAPABILITY);
+        }
+        if size == 0 {
+            return Ok(ListxattrReply::Count(names.len() as u32));
+        }
+        if names.len() > size as usize {
+            return Err(io::Error::from_raw_os_error(LINUX_ERANGE));
+        }
+        Ok(ListxattrReply::Names(names))
+    }
+
+    fn sandbox_removexattr(
+        &self,
+        ctx: &Context,
+        mapping: IdentityMapping,
+        inode: Inode,
+        name: &CStr,
+    ) -> io::Result<()> {
+        if name.to_bytes() == &SECURITY_CAPABILITY[..SECURITY_CAPABILITY.len() - 1] {
+            let (handle, host_st, metadata) = self.sandbox_inode_metadata(ctx, mapping, inode)?;
+            let mut metadata = metadata
+                .filter(|metadata| metadata.capability.is_some())
+                .ok_or_else(|| linux_error(io::Error::from_raw_os_error(libc::ENODATA)))?;
+            metadata.capability = None;
+            return write_sandbox_metadata(&handle, host_st, &metadata);
+        }
+
+        let host_name = user_xattr_host_name(name.to_bytes()).map_err(|error| match error {
+            NameError::TooLong => io::Error::from_raw_os_error(LINUX_ERANGE),
+            NameError::UnsupportedNamespace => {
+                linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            }
+        })?;
+        let host_name = CStr::from_bytes_with_nul(&host_name).map_err(|_| einval())?;
+        let (handle, host_st, _) = self.sandbox_inode_metadata(ctx, mapping, inode)?;
+        let options = sandbox_xattr_options(host_st);
+        let result = match handle {
+            InodeHandle::Path(path) => unsafe {
+                libc::removexattr(path.as_ptr(), host_name.as_ptr(), options)
+            },
+            InodeHandle::Fd(fd) => unsafe { libc::fremovexattr(fd, host_name.as_ptr(), options) },
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn entry_from_stat(&self, parent: Inode, st: bindings::stat64) -> io::Result<Entry> {
+        let parent_data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&parent)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let mut attr_flags: u32 = 0;
+
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && self.announce_submounts.load(Ordering::Relaxed)
+            && (st.st_dev != parent_data.dev)
+        {
+            attr_flags |= fuse::ATTR_SUBMOUNT;
+        }
+
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+        };
+        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+
+        let inode = if let Some(data) = data {
+            // Matches with the release store in `forget`.
+            data.refcount.fetch_add(1, Ordering::Acquire);
+            data.inode
+        } else {
+            // There is a possible race here where 2 threads end up adding the same file
+            // into the inode list.  However, since each of those will get a unique Inode
+            // value and unique file descriptors this shouldn't be that much of a problem.
+            let inode = self.inode_alloc.next();
+            self.inodes.write().unwrap().insert(
+                inode,
+                InodeAltKey {
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                },
+                Arc::new(InodeData {
+                    inode,
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                    refcount: AtomicU64::new(1),
+                    unlinked_fd: AtomicI64::new(-1),
+                }),
+            );
+
+            inode
+        };
+
+        Ok(Entry {
+            inode,
+            generation: 0,
+            attr: st,
+            attr_flags,
+            attr_timeout: self.cfg.attr_timeout,
+            entry_timeout: self.cfg.entry_timeout,
+        })
+    }
+
+    fn entry_from_file(&self, ctx: &Context, parent: Inode, file: &File) -> io::Result<Entry> {
+        let st = fstat(ctx, self.cfg.semantics, file.as_raw_fd(), false)?;
+        self.entry_from_stat(parent, st)
     }
 
     fn parse_open_flags(&self, flags: i32) -> i32 {
@@ -1384,6 +2178,21 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        // Sandbox cannot apply Linux security labels faithfully, so it must
+        // not negotiate per-create security contexts. Other macOS passthrough
+        // modes retain the existing carrier-xattr implementation.
+        if !matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+            && capable.contains(FsOptions::SECURITY_CTX)
+        {
+            opts |= FsOptions::SECURITY_CTX;
+        }
+
+        if matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+            && capable.contains(FsOptions::HANDLE_KILLPRIV_V2)
+        {
+            opts |= FsOptions::HANDLE_KILLPRIV_V2;
+        }
+
         Ok(opts)
     }
 
@@ -1410,14 +2219,6 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
         let c_path = self.name_to_path(parent, name)?;
         let st = lstat(&ctx, self.cfg.semantics, &c_path, false)?;
 
@@ -1427,56 +2228,7 @@ impl FileSystem for PassthroughFs {
             c_path.to_str().unwrap()
         );
 
-        let mut attr_flags: u32 = 0;
-
-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
-            && self.announce_submounts.load(Ordering::Relaxed)
-            && (st.st_dev != parent_data.dev)
-        {
-            attr_flags |= fuse::ATTR_SUBMOUNT;
-        }
-
-        let altkey = InodeAltKey {
-            ino: st.st_ino,
-            dev: st.st_dev,
-        };
-        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
-
-        let inode = if let Some(data) = data {
-            // Matches with the release store in `forget`.
-            data.refcount.fetch_add(1, Ordering::Acquire);
-            data.inode
-        } else {
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.inode_alloc.next();
-            self.inodes.write().unwrap().insert(
-                inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                },
-                Arc::new(InodeData {
-                    inode,
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                    refcount: AtomicU64::new(1),
-                    unlinked_fd: AtomicI64::new(-1),
-                }),
-            );
-
-            inode
-        };
-
-        Ok(Entry {
-            inode,
-            generation: 0,
-            attr: st,
-            attr_flags,
-            attr_timeout: self.cfg.attr_timeout,
-            entry_timeout: self.cfg.entry_timeout,
-        })
+        self.entry_from_stat(parent, st)
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -1521,31 +2273,47 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        if matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+            && extensions.secctx.is_some()
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
         let c_path = self.name_to_path(parent, name)?;
 
         let (host_mode, complete) = match self.cfg.semantics {
             PermissionSemantics::LinuxComplete => (0o700, true),
             PermissionSemantics::LinuxSimplified => ((mode & !umask) as u16, false),
+            PermissionSemantics::Sandbox(_) => (0o700, true),
         };
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdir(c_path.as_ptr(), host_mode) };
         if res == 0 {
-            let ihandle = InodeHandle::Path(c_path);
+            let ihandle = InodeHandle::Path(c_path.clone());
             // Set security context
             if let Some(secctx) = extensions.secctx {
                 set_secctx(&ihandle, secctx, false)?
             };
 
-            if complete {
-                set_stat(
+            if complete
+                && let Err(error) = set_stat(
                     &ctx,
                     self.cfg.semantics,
                     &ihandle,
                     None,
                     Some((ctx.uid, ctx.gid)),
                     Some(mode & !umask),
-                )?;
+                )
+            {
+                if matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_)) {
+                    // A pathname cleanup could delete a host replacement
+                    // installed after mkdir. The failed operation may leave a
+                    // native entry, matching the documented host boundary.
+                    warn!(
+                        "directory metadata attachment failed; a native host entry may remain: {error}"
+                    );
+                }
+                return Err(error);
             }
             self.lookup(ctx, parent, name)
         } else {
@@ -1632,9 +2400,21 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        if matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+            && extensions.secctx.is_some()
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
         let c_path = self.name_to_path(parent, name)?;
 
         let flags = self.parse_open_flags(flags as i32);
+        let sandbox = matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_));
+        let sandbox_truncate = sandbox && flags & libc::O_TRUNC != 0;
+        let open_flags = if sandbox_truncate {
+            flags & !libc::O_TRUNC
+        } else {
+            flags
+        };
         let (host_mode, complete) = match self.cfg.semantics {
             PermissionSemantics::LinuxComplete => {
                 let mode = if (flags & libc::O_DIRECTORY) != 0 {
@@ -1645,34 +2425,62 @@ impl FileSystem for PassthroughFs {
                 (mode, true)
             }
             PermissionSemantics::LinuxSimplified => (mode & !(umask & 0o777), false),
+            PermissionSemantics::Sandbox(_) => {
+                let mode = if (flags & libc::O_DIRECTORY) != 0 {
+                    0o700
+                } else {
+                    0o600
+                };
+                (mode, true)
+            }
         };
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                host_mode,
-            )
+        let (fd, created) = if sandbox {
+            open_sandbox_create(&c_path, open_flags, host_mode)?
+        } else {
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    open_flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    host_mode,
+                )
+            };
+            if fd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+            (fd, true)
         };
-        if fd < 0 {
-            return Err(linux_error(io::Error::last_os_error()));
-        }
-        let ihandle = InodeHandle::Fd(fd);
+        // Safe because this function now owns the descriptor returned above.
+        // Keeping it in File ensures every later error path closes it.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let ihandle = InodeHandle::Fd(file.as_raw_fd());
+        let guest_mode = libc::S_IFREG as u32 | (mode & !(umask & 0o777));
+        let guest_mode = if sandbox_truncate && kill_priv {
+            clear_suid_sgid(guest_mode)
+        } else {
+            guest_mode
+        };
 
         if complete
+            && (!sandbox || created)
             && let Err(e) = set_stat(
                 &ctx,
                 self.cfg.semantics,
                 &ihandle,
                 None,
                 Some((ctx.uid, ctx.gid)),
-                Some(libc::S_IFREG as u32 | (mode & !(umask & 0o777))),
+                Some(guest_mode),
             )
         {
-            unsafe { libc::close(fd) };
+            if sandbox && created {
+                // Even though this request created the inode behind `fd`, the
+                // pathname may now name a host replacement. Never unlink by
+                // path after the metadata operation has failed.
+                warn!("file metadata attachment failed; a native host entry may remain: {e}");
+            }
             return Err(e);
         }
 
@@ -1681,17 +2489,29 @@ impl FileSystem for PassthroughFs {
             set_secctx(&ihandle, secctx, false)?
         };
 
-        // If O_TRUNC and kill_priv (OPEN_KILL_SUIDGID), clear security.capability.
-        // We don't need to clear suid/sgid here because we've just updated them
-        // unconditionally above.
-        if (flags & libc::O_TRUNC) != 0 && kill_priv {
+        if sandbox_truncate
+            && !created
+            && let PermissionSemantics::Sandbox(config) = self.cfg.semantics
+        {
+            // As in OPEN, remove privilege metadata before mutating existing
+            // contents. A newly created file is already empty, and its mode
+            // was adjusted above when kill_priv required it.
+            prepare_sandbox_content_mutation(&ctx, config, &ihandle, kill_priv)?;
+            if unsafe { libc::ftruncate(fd, 0) } < 0 {
+                let error = linux_error(io::Error::last_os_error());
+                return Err(error);
+            }
+        } else if (flags & libc::O_TRUNC) != 0 && kill_priv && !sandbox {
+            // LinuxComplete stores capabilities separately and has already
+            // updated the new file's ownership and mode above.
             remove_security_capability(&ihandle);
         }
 
-        // Safe because we just opened this fd.
-        let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
-
-        let entry = self.lookup(ctx, parent, name)?;
+        // Build the entry from the opened descriptor. Looking the pathname up
+        // again could bind the entry to a host replacement while the returned
+        // handle still refers to the file opened above.
+        let entry = self.entry_from_file(&ctx, parent, &file)?;
+        let file = RwLock::new(file);
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
@@ -1768,10 +2588,25 @@ impl FileSystem for PassthroughFs {
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
         let f = data.file.read().unwrap();
+        if let PermissionSemantics::Sandbox(config) = self.cfg.semantics {
+            // Capability metadata is removed before every content write;
+            // kill_priv controls the setuid/setgid bits only. If replacement
+            // fails, the write must not happen; if the later write fails,
+            // keeping privileges removed is the conservative result.
+            prepare_sandbox_content_mutation(
+                &ctx,
+                config,
+                &InodeHandle::Fd(f.as_raw_fd()),
+                kill_priv,
+            )?;
+        }
         let result = r.read_to(&f, size as usize, offset);
 
         // If write succeeded and kill_priv is set, clear security.capability and suid/sgid
-        if result.is_ok() && kill_priv {
+        if result.is_ok()
+            && kill_priv
+            && !matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+        {
             let fd = f.as_raw_fd();
             let ihandle = InodeHandle::Fd(fd);
 
@@ -1832,7 +2667,52 @@ impl FileSystem for PassthroughFs {
             self.inode_to_handle(inode, true)?
         };
 
-        if valid.contains(SetattrValid::MODE) {
+        if let PermissionSemantics::Sandbox(config) = self.cfg.semantics {
+            let metadata_mode = valid
+                .contains(SetattrValid::MODE)
+                .then_some(attr.st_mode as u32);
+            let metadata_owner = valid
+                .intersects(SetattrValid::UID | SetattrValid::GID)
+                .then_some((
+                    if valid.contains(SetattrValid::UID) {
+                        attr.st_uid
+                    } else {
+                        u32::MAX
+                    },
+                    if valid.contains(SetattrValid::GID) {
+                        attr.st_gid
+                    } else {
+                        u32::MAX
+                    },
+                ));
+            let clear_capability = metadata_owner.is_some() || valid.contains(SetattrValid::SIZE);
+            let clear_mode_privileges = metadata_owner.is_some()
+                || (valid.contains(SetattrValid::SIZE)
+                    && valid.contains(SetattrValid::KILL_SUIDGID));
+            if metadata_mode.is_some()
+                || metadata_owner.is_some()
+                || clear_capability
+                || clear_mode_privileges
+            {
+                // The complete record is replaced once so one setattr request
+                // can never publish a new owner with stale privilege bits.
+                update_sandbox_metadata(
+                    &ctx,
+                    config,
+                    &ihandle,
+                    None,
+                    metadata_owner,
+                    metadata_mode,
+                    clear_capability,
+                    clear_mode_privileges,
+                    metadata_mode.is_some() || metadata_owner.is_some(),
+                )?;
+            }
+        }
+
+        if valid.contains(SetattrValid::MODE)
+            && !matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+        {
             set_stat(
                 &ctx,
                 self.cfg.semantics,
@@ -1843,7 +2723,9 @@ impl FileSystem for PassthroughFs {
             )?
         }
 
-        if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
+        if valid.intersects(SetattrValid::UID | SetattrValid::GID)
+            && !matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+        {
             let uid = if valid.contains(SetattrValid::UID) {
                 attr.st_uid
             } else {
@@ -1886,19 +2768,21 @@ impl FileSystem for PassthroughFs {
                         return Err(linux_error(io::Error::last_os_error()));
                     }
 
-                    // Clear security.capability on truncate unconditionally
-                    remove_security_capability(&ihandle);
-                    let st = fstat(&ctx, self.cfg.semantics, fd, false)?;
-                    let new_mode = clear_suid_sgid(st.st_mode as u32);
-                    if new_mode != st.st_mode as u32 {
-                        set_stat(
-                            &ctx,
-                            self.cfg.semantics,
-                            &ihandle,
-                            Some(st),
-                            None,
-                            Some(new_mode),
-                        )?;
+                    if !matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_)) {
+                        // Clear security.capability on truncate unconditionally
+                        remove_security_capability(&ihandle);
+                        let st = fstat(&ctx, self.cfg.semantics, fd, false)?;
+                        let new_mode = clear_suid_sgid(st.st_mode as u32);
+                        if new_mode != st.st_mode as u32 {
+                            set_stat(
+                                &ctx,
+                                self.cfg.semantics,
+                                &ihandle,
+                                Some(st),
+                                None,
+                                Some(new_mode),
+                            )?;
+                        }
                     }
                 }
                 InodeHandle::Path(_) => {
@@ -1909,23 +2793,25 @@ impl FileSystem for PassthroughFs {
                         return Err(linux_error(io::Error::last_os_error()));
                     }
 
-                    // Clear security.capability on truncate unconditionally
-                    //
-                    // Do this here even if it means duplicating the code above to be able to
-                    // reuse the FD we just opened, thus reducing the number of syscalls.
-                    let ihandle = InodeHandle::Fd(f.as_raw_fd());
-                    remove_security_capability(&ihandle);
-                    let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
-                    let new_mode = clear_suid_sgid(st.st_mode as u32);
-                    if new_mode != st.st_mode as u32 {
-                        set_stat(
-                            &ctx,
-                            self.cfg.semantics,
-                            &ihandle,
-                            Some(st),
-                            None,
-                            Some(new_mode),
-                        )?;
+                    if !matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_)) {
+                        // Clear security.capability on truncate unconditionally
+                        //
+                        // Do this here even if it means duplicating the code above to be able to
+                        // reuse the FD we just opened, thus reducing the number of syscalls.
+                        let ihandle = InodeHandle::Fd(f.as_raw_fd());
+                        remove_security_capability(&ihandle);
+                        let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
+                        let new_mode = clear_suid_sgid(st.st_mode as u32);
+                        if new_mode != st.st_mode as u32 {
+                            set_stat(
+                                &ctx,
+                                self.cfg.semantics,
+                                &ihandle,
+                                Some(st),
+                                None,
+                                Some(new_mode),
+                            )?;
+                        }
                     }
                 }
             };
@@ -1997,6 +2883,11 @@ impl FileSystem for PassthroughFs {
         {
             return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
         }
+        if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0
+            && matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
 
         let old_cpath = self.name_to_path(olddir, oldname)?;
         let new_cpath = self.name_to_path(newdir, newname)?;
@@ -2059,6 +2950,7 @@ impl FileSystem for PassthroughFs {
                     PermissionSemantics::LinuxSimplified => {
                         (((libc::S_IFCHR | 0o600) as u32), false)
                     }
+                    PermissionSemantics::Sandbox(_) => unreachable!(),
                 };
                 let fd = unsafe {
                     libc::open(
@@ -2116,6 +3008,9 @@ impl FileSystem for PassthroughFs {
             PermissionSemantics::LinuxSimplified => {
                 self.mknod_simplified(ctx, parent, name, mode, rdev, umask, extensions)
             }
+            PermissionSemantics::Sandbox(_) => {
+                self.mknod_sandbox(ctx, parent, name, mode, umask, extensions)
+            }
         }
     }
 
@@ -2149,29 +3044,53 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        if matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_))
+            && extensions.secctx.is_some()
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
         let c_path = self.name_to_path(parent, name)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::symlink(linkname.as_ptr(), c_path.as_ptr()) };
         if res == 0 {
-            let ihandle = InodeHandle::Path(c_path);
+            let ihandle = InodeHandle::Path(c_path.clone());
 
             // Set security context
             if let Some(secctx) = extensions.secctx {
                 set_secctx(&ihandle, secctx, true)?
             };
 
-            let mut entry = self.lookup(ctx, parent, name)?;
-            if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            if matches!(
+                self.cfg.semantics,
+                PermissionSemantics::LinuxComplete | PermissionSemantics::Sandbox(_)
+            ) {
                 let mode = libc::S_IFLNK | 0o777;
-                set_stat(
+                if let Err(error) = set_stat(
                     &ctx,
                     self.cfg.semantics,
                     &ihandle,
                     None,
                     Some((ctx.uid, ctx.gid)),
                     Some(mode as u32),
-                )?;
+                ) {
+                    if matches!(self.cfg.semantics, PermissionSemantics::Sandbox(_)) {
+                        // Symlinks cannot be unlinked through an identity-bound
+                        // handle. Avoid deleting a host replacement at the
+                        // same path after the metadata failure.
+                        warn!(
+                            "symlink metadata attachment failed; a native host entry may remain: {error}"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+            let mut entry = self.lookup(ctx, parent, name)?;
+            if matches!(
+                self.cfg.semantics,
+                PermissionSemantics::LinuxComplete | PermissionSemantics::Sandbox(_)
+            ) {
+                let mode = libc::S_IFLNK | 0o777;
                 entry.attr.st_uid = ctx.uid;
                 entry.attr.st_gid = ctx.gid;
                 entry.attr.st_mode = mode;
@@ -2330,7 +3249,7 @@ impl FileSystem for PassthroughFs {
 
     fn setxattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         name: &CStr,
         value: &[u8],
@@ -2340,6 +3259,13 @@ impl FileSystem for PassthroughFs {
 
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        if let PermissionSemantics::Sandbox(config) = self.cfg.semantics {
+            if !config.xattrs_enabled {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+            }
+            return self.sandbox_setxattr(&ctx, config.identity, inode, name, value, flags);
         }
 
         if name.to_bytes() == XATTR_KEY {
@@ -2391,7 +3317,7 @@ impl FileSystem for PassthroughFs {
 
     fn getxattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         name: &CStr,
         size: u32,
@@ -2400,6 +3326,13 @@ impl FileSystem for PassthroughFs {
 
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        if let PermissionSemantics::Sandbox(config) = self.cfg.semantics {
+            if !config.xattrs_enabled {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+            }
+            return self.sandbox_getxattr(&ctx, config.identity, inode, name, size);
         }
 
         if name.to_bytes() == XATTR_KEY {
@@ -2469,9 +3402,16 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+    fn listxattr(&self, ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        if let PermissionSemantics::Sandbox(config) = self.cfg.semantics {
+            if !config.xattrs_enabled {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+            }
+            return self.sandbox_listxattr(&ctx, config.identity, inode, size);
         }
 
         let mut buf = vec![0; 512_usize];
@@ -2534,9 +3474,16 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+    fn removexattr(&self, ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        if let PermissionSemantics::Sandbox(config) = self.cfg.semantics {
+            if !config.xattrs_enabled {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+            }
+            return self.sandbox_removexattr(&ctx, config.identity, inode, name);
         }
 
         if name.to_bytes() == XATTR_KEY {
@@ -2827,5 +3774,513 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, process};
+
+    use super::*;
+
+    static NEXT_TEMP_TREE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempTree {
+        path: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!(
+                "krun-macos-passthrough-{name}-{}-{unique}-{}",
+                process::id(),
+                NEXT_TEMP_TREE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn c_path(&self, name: &str) -> CString {
+            CString::new(self.path.join(name).to_string_lossy().as_bytes()).unwrap()
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn context() -> Context {
+        Context {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            pid: 0,
+        }
+    }
+
+    fn sandbox_config(xattrs_enabled: bool) -> SandboxConfig {
+        SandboxConfig {
+            identity: IdentityMapping {
+                host_uid: unsafe { libc::geteuid() },
+                host_gid: unsafe { libc::getegid() },
+                guest_uid: 0,
+                guest_gid: 0,
+            },
+            xattrs_enabled,
+        }
+    }
+
+    fn v2_capability() -> Vec<u8> {
+        let mut capability = vec![0; 20];
+        capability[..4].copy_from_slice(&0x0200_0000_u32.to_le_bytes());
+        capability
+    }
+
+    #[test]
+    fn sandbox_does_not_negotiate_security_contexts() {
+        let root = TempTree::new("security-context");
+        let capable = FsOptions::SECURITY_CTX;
+        let native = PassthroughFs::new(
+            Config {
+                root_dir: root.path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        assert!(
+            native
+                .init(capable)
+                .unwrap()
+                .contains(FsOptions::SECURITY_CTX)
+        );
+
+        let sandbox = PassthroughFs::new(
+            Config {
+                root_dir: root.path.to_string_lossy().into_owned(),
+                semantics: PermissionSemantics::Sandbox(sandbox_config(true)),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        assert!(
+            !sandbox
+                .init(capable)
+                .unwrap()
+                .contains(FsOptions::SECURITY_CTX)
+        );
+    }
+
+    #[test]
+    fn sandbox_rejects_guest_identity_that_collides_with_overflow() {
+        let root = TempTree::new("overflow-identity");
+        for identity in [
+            IdentityMapping {
+                guest_uid: OVERFLOW_ID,
+                ..sandbox_config(true).identity
+            },
+            IdentityMapping {
+                guest_gid: OVERFLOW_ID,
+                ..sandbox_config(true).identity
+            },
+        ] {
+            let result = PassthroughFs::new(
+                Config {
+                    root_dir: root.path.to_string_lossy().into_owned(),
+                    semantics: PermissionSemantics::Sandbox(SandboxConfig {
+                        identity,
+                        xattrs_enabled: true,
+                    }),
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            );
+            let error = match result {
+                Ok(_) => panic!("overflow identity unexpectedly accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        }
+    }
+
+    #[test]
+    fn native_only_mode_does_not_hide_existing_metadata() {
+        let root = TempTree::new("existing-metadata");
+        let path = root.c_path("adopted");
+        fs::write(root.path.join("adopted"), "contents").unwrap();
+        let ctx = context();
+        let host_st = lstat(&ctx, PermissionSemantics::LinuxComplete, &path, true).unwrap();
+        write_sandbox_metadata(
+            &InodeHandle::Path(path.clone()),
+            host_st,
+            &GuestMetadata {
+                uid: 123,
+                gid: 456,
+                mode: libc::S_IFREG as u32 | 0o640,
+                capability: None,
+            },
+        )
+        .unwrap();
+
+        let st = lstat(
+            &ctx,
+            PermissionSemantics::Sandbox(sandbox_config(false)),
+            &path,
+            false,
+        )
+        .unwrap();
+        assert_eq!((st.st_uid, st.st_gid), (123, 456));
+        assert_eq!(st.st_mode as u32 & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn native_only_content_mutation_succeeds_when_metadata_is_unchanged() {
+        let root = TempTree::new("native-content");
+        let path = root.c_path("native");
+        fs::write(root.path.join("native"), "contents").unwrap();
+
+        prepare_sandbox_content_mutation(
+            &context(),
+            sandbox_config(false),
+            &InodeHandle::Path(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        let host_st = lstat(&context(), PermissionSemantics::LinuxComplete, &path, true).unwrap();
+        assert_eq!(
+            read_sandbox_metadata(&InodeHandle::Path(path), host_st).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn native_only_create_succeeds_when_native_metadata_matches() {
+        let root = TempTree::new("native-create");
+        let passthrough = PassthroughFs::new(
+            Config {
+                root_dir: root.path.to_string_lossy().into_owned(),
+                semantics: PermissionSemantics::Sandbox(sandbox_config(false)),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+        let name = CString::new("native").unwrap();
+        let guest_root = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+
+        let entry = passthrough
+            .mknod(
+                guest_root,
+                fuse::ROOT_ID,
+                &name,
+                libc::S_IFREG as u32 | 0o600,
+                0,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+
+        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (0, 0));
+        assert_eq!(entry.attr.st_mode as u32 & 0o7777, 0o600);
+        let path = root.c_path("native");
+        let host_st = lstat(&context(), PermissionSemantics::LinuxComplete, &path, true).unwrap();
+        assert_eq!(
+            read_sandbox_metadata(&InodeHandle::Path(path), host_st).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn opened_stat_ignores_path_replacement() {
+        let root = TempTree::new("stat-replacement");
+        let path = root.c_path("file");
+        fs::write(root.path.join("file"), "opened").unwrap();
+        let ctx = context();
+        let original_host_st =
+            lstat(&ctx, PermissionSemantics::LinuxComplete, &path, true).unwrap();
+        write_sandbox_metadata(
+            &InodeHandle::Path(path.clone()),
+            original_host_st,
+            &GuestMetadata {
+                uid: 123,
+                gid: 456,
+                mode: libc::S_IFREG as u32 | 0o640,
+                capability: None,
+            },
+        )
+        .unwrap();
+        let file = open_sandbox_stat(&path).unwrap();
+
+        fs::rename(root.path.join("file"), root.path.join("detached")).unwrap();
+        fs::write(root.path.join("file"), "replacement").unwrap();
+        let replacement_st = lstat(&ctx, PermissionSemantics::LinuxComplete, &path, true).unwrap();
+
+        let st = fstat(
+            &ctx,
+            PermissionSemantics::Sandbox(sandbox_config(true)),
+            file.as_raw_fd(),
+            false,
+        )
+        .unwrap();
+        assert_eq!((st.st_uid, st.st_gid), (123, 456));
+        assert_eq!(st.st_mode as u32 & 0o7777, 0o640);
+        assert_eq!(
+            (st.st_dev, st.st_ino),
+            (original_host_st.st_dev, original_host_st.st_ino)
+        );
+        assert_ne!(
+            (st.st_dev, st.st_ino),
+            (replacement_st.st_dev, replacement_st.st_ino)
+        );
+    }
+
+    #[test]
+    fn sandbox_lstat_reads_symlink_metadata_from_open_descriptor() {
+        let root = TempTree::new("symlink-stat");
+        let path = root.c_path("link");
+        symlink("target", root.path.join("link")).unwrap();
+        let ctx = context();
+        let host_st = lstat(&ctx, PermissionSemantics::LinuxComplete, &path, true).unwrap();
+        write_sandbox_metadata(
+            &InodeHandle::Path(path.clone()),
+            host_st,
+            &GuestMetadata {
+                uid: 123,
+                gid: 456,
+                mode: libc::S_IFLNK as u32 | 0o777,
+                capability: None,
+            },
+        )
+        .unwrap();
+
+        let st = lstat(
+            &ctx,
+            PermissionSemantics::Sandbox(sandbox_config(true)),
+            &path,
+            false,
+        )
+        .unwrap();
+        assert_eq!((st.st_uid, st.st_gid), (123, 456));
+        assert_eq!(
+            st.st_mode as u32 & libc::S_IFMT as u32,
+            libc::S_IFLNK as u32
+        );
+    }
+
+    #[test]
+    fn sandbox_lstat_rejects_fifo_without_blocking() {
+        assert_ne!(SANDBOX_STAT_OPEN_FLAGS & libc::O_NONBLOCK, 0);
+        let root = TempTree::new("fifo-stat");
+        let path = root.c_path("fifo");
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let error = lstat(
+            &context(),
+            PermissionSemantics::Sandbox(sandbox_config(true)),
+            &path,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(LINUX_EOPNOTSUPP));
+    }
+
+    #[test]
+    fn content_mutation_clears_capability_without_kill_priv() {
+        let root = TempTree::new("content-capability");
+        let path = root.c_path("capable");
+        fs::write(root.path.join("capable"), "contents").unwrap();
+        let ctx = context();
+        let host_st = lstat(&ctx, PermissionSemantics::LinuxComplete, &path, true).unwrap();
+        write_sandbox_metadata(
+            &InodeHandle::Path(path.clone()),
+            host_st,
+            &GuestMetadata {
+                uid: 0,
+                gid: 0,
+                mode: libc::S_IFREG as u32 | 0o755,
+                capability: Some(v2_capability()),
+            },
+        )
+        .unwrap();
+
+        prepare_sandbox_content_mutation(
+            &ctx,
+            sandbox_config(true),
+            &InodeHandle::Path(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        let metadata = read_sandbox_metadata(&InodeHandle::Path(path), host_st)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.capability, None);
+        assert_eq!(metadata.mode & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn create_truncate_applies_kill_priv_to_requested_mode() {
+        let root = TempTree::new("create-kill-priv");
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: root.path.to_string_lossy().into_owned(),
+                semantics: PermissionSemantics::Sandbox(sandbox_config(true)),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::HANDLE_KILLPRIV_V2).unwrap();
+        let name = CString::new("created").unwrap();
+        let flags = (bindings::LINUX_O_CREAT | bindings::LINUX_O_TRUNC | libc::O_WRONLY) as u32;
+
+        let (entry, handle, _) = fs
+            .create(
+                context(),
+                fuse::ROOT_ID,
+                &name,
+                0o6755,
+                true,
+                flags,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+
+        let path = root.c_path("created");
+        let host_st = lstat(&context(), PermissionSemantics::LinuxComplete, &path, true).unwrap();
+        let metadata = read_sandbox_metadata(&InodeHandle::Path(path), host_st)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.mode & 0o7777, 0o755);
+
+        fs.release(
+            context(),
+            entry.inode,
+            flags,
+            handle.unwrap(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sandbox_create_preserves_caller_exclusivity() {
+        let root = TempTree::new("create");
+        let path = root.c_path("file");
+
+        let (fd, created) = open_sandbox_create(&path, libc::O_WRONLY, 0o600).unwrap();
+        assert!(created);
+        unsafe { libc::close(fd) };
+
+        let (fd, created) = open_sandbox_create(&path, libc::O_WRONLY, 0o600).unwrap();
+        assert!(!created);
+        unsafe { libc::close(fd) };
+
+        let error = open_sandbox_create(&path, libc::O_WRONLY | libc::O_EXCL, 0o600).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            linux_error(io::Error::from_raw_os_error(libc::EEXIST)).raw_os_error()
+        );
+    }
+
+    #[test]
+    fn opened_file_entry_ignores_path_replacement() {
+        let root = TempTree::new("create-replacement");
+        let passthrough = PassthroughFs::new(
+            Config {
+                root_dir: root.path.to_string_lossy().into_owned(),
+                semantics: PermissionSemantics::Sandbox(sandbox_config(true)),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let path = root.path.join("file");
+        fs::write(&path, "opened").unwrap();
+        let file = File::open(&path).unwrap();
+        let ctx = context();
+
+        fs::rename(&path, root.path.join("detached")).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        let opened_st = fstat(&ctx, passthrough.cfg.semantics, file.as_raw_fd(), false).unwrap();
+        let replacement_st =
+            lstat(&ctx, passthrough.cfg.semantics, &root.c_path("file"), false).unwrap();
+
+        let entry = passthrough
+            .entry_from_file(&ctx, fuse::ROOT_ID, &file)
+            .unwrap();
+        assert_eq!(
+            (entry.attr.st_dev, entry.attr.st_ino),
+            (opened_st.st_dev, opened_st.st_ino)
+        );
+        assert_ne!(
+            (entry.attr.st_dev, entry.attr.st_ino),
+            (replacement_st.st_dev, replacement_st.st_ino)
+        );
+        let registered = passthrough
+            .inodes
+            .read()
+            .unwrap()
+            .get(&entry.inode)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            (registered.dev, registered.ino),
+            (opened_st.st_dev, opened_st.st_ino)
+        );
+    }
+
+    #[test]
+    fn metadata_attachment_failure_does_not_unlink_by_path() {
+        let root = TempTree::new("metadata-failure");
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: root.path.to_string_lossy().into_owned(),
+                semantics: PermissionSemantics::Sandbox(sandbox_config(false)),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let name = CString::new("unadopted").unwrap();
+
+        let error = match fs.mknod(
+            context(),
+            fuse::ROOT_ID,
+            &name,
+            libc::S_IFREG as u32 | 0o644,
+            0,
+            0,
+            Extensions::default(),
+        ) {
+            Ok(_) => panic!("metadata attachment unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.raw_os_error(), Some(LINUX_EOPNOTSUPP));
+        assert!(root.path.join("unadopted").exists());
     }
 }

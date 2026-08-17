@@ -19,6 +19,10 @@ use krun_display::DisplayBackend;
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+#[cfg(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub use devices::virtio::passthrough::IdentityMapping as FsIdentityMapping;
+#[cfg(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub use devices::virtio::passthrough::SandboxConfig as FsSandboxConfig;
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
@@ -65,7 +69,7 @@ use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use vmm::vmm_config::fs::FsPassthroughMaskConfig;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use vmm::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig};
+use vmm::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig, FsPassthroughMode};
 use vmm::vmm_config::kernel_bundle::InitrdBundle;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -676,6 +680,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
             shm,
             read_only,
             None,
+            FsPassthroughMode::LinuxComplete,
         )
     }
 }
@@ -689,7 +694,38 @@ pub fn krun_add_virtiofs_masked(
     read_only: bool,
     mask: Option<FsPassthroughMaskConfig>,
 ) -> i32 {
-    krun_add_virtiofs_config(ctx_id, tag, Some(path), shm_size, read_only, mask)
+    krun_add_virtiofs_config(
+        ctx_id,
+        tag,
+        Some(path),
+        shm_size,
+        read_only,
+        mask,
+        FsPassthroughMode::LinuxComplete,
+    )
+}
+
+/// Add Sandbox's macOS host-directory backend without extending libkrun's C
+/// API with project-specific identity and mask configuration.
+#[cfg(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub fn krun_add_sandbox_virtiofs(
+    ctx_id: u32,
+    tag: String,
+    path: String,
+    shm_size: Option<usize>,
+    read_only: bool,
+    mask: Option<FsPassthroughMaskConfig>,
+    config: FsSandboxConfig,
+) -> i32 {
+    krun_add_virtiofs_config(
+        ctx_id,
+        tag,
+        Some(path),
+        shm_size,
+        read_only,
+        mask,
+        FsPassthroughMode::Sandbox(config),
+    )
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -700,6 +736,7 @@ fn krun_add_virtiofs_config(
     shm_size: Option<usize>,
     read_only: bool,
     mask: Option<FsPassthroughMaskConfig>,
+    mode: FsPassthroughMode,
 ) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -718,6 +755,7 @@ fn krun_add_virtiofs_config(
                         read_only,
                         virtual_entries,
                         mask,
+                        mode,
                     },
                     None => FsDeviceBackend::Null { virtual_entries },
                 },
@@ -3431,8 +3469,14 @@ mod test_disable_implicit_init {
         let ctx_map = CTX_MAP.lock().unwrap();
         let cfg = ctx_map.get(&ctx).unwrap();
         assert_eq!(cfg.vmr.fs.len(), 1);
+        let FsDeviceBackend::Passthrough {
+            virtual_entries, ..
+        } = &cfg.vmr.fs[0].backend
+        else {
+            panic!("root virtiofs should use the passthrough backend");
+        };
         assert!(
-            cfg.vmr.fs[0].virtual_entries.is_empty(),
+            virtual_entries.is_empty(),
             "root virtiofs should not inject init.krun after krun_disable_implicit_init()"
         );
         drop(ctx_map);

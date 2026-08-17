@@ -127,6 +127,7 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> MaskFs<L> {
     pub fn new(
         lower: L,
         config: MaskConfig,
+        upper_semantics: passthrough::PermissionSemantics,
         inode_alloc: Arc<InodeAllocator>,
         case_insensitive: bool,
     ) -> io::Result<Self> {
@@ -138,11 +139,15 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> MaskFs<L> {
                     std::fs::create_dir_all(storage_path(&storage, &path[..path.len() - 1]))?;
                 }
             }
+            // Mask storage is only a different host location, not a different
+            // guest filesystem. It must preserve the lower backend's identity
+            // and metadata semantics when requests route into the upper path.
             Some(PassthroughFs::new(
                 passthrough::Config {
                     root_dir: storage,
                     entry_timeout: Duration::ZERO,
                     attr_timeout: Duration::ZERO,
+                    semantics: upper_semantics,
                     ..Default::default()
                 },
                 inode_alloc,
@@ -292,14 +297,14 @@ impl<L: FileSystem<Inode = Inode, Handle = Handle>> MaskFs<L> {
     }
 
     fn entry_type(attr: bindings::stat64) -> u32 {
-        match attr.st_mode as u32 & libc::S_IFMT as u32 {
-            mode if mode == libc::S_IFDIR as u32 => libc::DT_DIR as u32,
-            mode if mode == libc::S_IFLNK as u32 => libc::DT_LNK as u32,
-            mode if mode == libc::S_IFCHR as u32 => libc::DT_CHR as u32,
-            mode if mode == libc::S_IFBLK as u32 => libc::DT_BLK as u32,
-            mode if mode == libc::S_IFIFO as u32 => libc::DT_FIFO as u32,
-            mode if mode == libc::S_IFSOCK as u32 => libc::DT_SOCK as u32,
-            mode if mode == libc::S_IFREG as u32 => libc::DT_REG as u32,
+        match attr.st_mode & libc::S_IFMT {
+            mode if mode == libc::S_IFDIR => libc::DT_DIR as u32,
+            mode if mode == libc::S_IFLNK => libc::DT_LNK as u32,
+            mode if mode == libc::S_IFCHR => libc::DT_CHR as u32,
+            mode if mode == libc::S_IFBLK => libc::DT_BLK as u32,
+            mode if mode == libc::S_IFIFO => libc::DT_FIFO as u32,
+            mode if mode == libc::S_IFSOCK => libc::DT_SOCK as u32,
+            mode if mode == libc::S_IFREG => libc::DT_REG as u32,
             _ => libc::DT_UNKNOWN as u32,
         }
     }
@@ -1216,6 +1221,7 @@ fn storage_path(storage: &str, components: &[Vec<u8>]) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1224,6 +1230,8 @@ mod tests {
         path: PathBuf,
     }
 
+    static NEXT_TEMP_TREE: AtomicU64 = AtomicU64::new(0);
+
     impl TempTree {
         fn new(name: &str) -> Self {
             let unique = SystemTime::now()
@@ -1231,8 +1239,9 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "krun-mask-fs-{name}-{}-{unique}",
-                std::process::id()
+                "krun-mask-fs-{name}-{}-{unique}-{}",
+                std::process::id(),
+                NEXT_TEMP_TREE.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).unwrap();
             Self { path }
@@ -1273,6 +1282,7 @@ mod tests {
                 paths: vec!["/node_modules".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
             },
+            passthrough::PermissionSemantics::LinuxComplete,
             inode_alloc,
             false,
         )
@@ -1318,6 +1328,7 @@ mod tests {
                 paths: vec!["/node_modules".to_string(), "/preexisting".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
             },
+            passthrough::PermissionSemantics::LinuxComplete,
             inode_alloc,
             false,
         )
@@ -1397,6 +1408,7 @@ mod tests {
                 paths: vec!["/.git".to_string()],
                 storage: Some(storage.path.to_string_lossy().into_owned()),
             },
+            passthrough::PermissionSemantics::LinuxComplete,
             inode_alloc,
             true,
         )

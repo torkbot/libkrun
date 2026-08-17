@@ -75,6 +75,8 @@ use crate::signal_handler::register_sigwinch_handler;
 use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
+#[cfg(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro"))))]
+use crate::vmm_config::fs::FsPassthroughMode;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::vmm_config::fs::{FsDeviceBackend, FsDeviceConfig};
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
@@ -2202,9 +2204,27 @@ fn attach_fs_devices(
                     read_only,
                     virtual_entries,
                     mask,
+                    mode,
                 } => devices::virtio::Fs::new(
                     config.fs_id.clone(),
-                    PermissionSemantics::LinuxComplete,
+                    {
+                        #[cfg(target_os = "macos")]
+                        {
+                            match mode {
+                                FsPassthroughMode::LinuxComplete => {
+                                    PermissionSemantics::LinuxComplete
+                                }
+                                FsPassthroughMode::Sandbox(config) => {
+                                    PermissionSemantics::Sandbox(*config)
+                                }
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = mode;
+                            PermissionSemantics::LinuxComplete
+                        }
+                    },
                     shared_dir.clone(),
                     exit_code.clone(),
                     *read_only,

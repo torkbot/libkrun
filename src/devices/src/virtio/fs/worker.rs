@@ -174,9 +174,16 @@ impl FsWorker {
                 mask: Some(mask),
             } => {
                 let case_insensitive = host_path_is_case_insensitive(&config.root_dir)?;
+                let upper_semantics = config.semantics;
                 let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFsRo::new(config, inode_alloc.clone())?;
-                let inner = MaskFs::new(lower, mask, inode_alloc.clone(), case_insensitive)?;
+                let inner = MaskFs::new(
+                    lower,
+                    mask,
+                    upper_semantics,
+                    inode_alloc.clone(),
+                    case_insensitive,
+                )?;
                 FsServer::MaskedReadOnly(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
@@ -203,9 +210,16 @@ impl FsWorker {
                 ..
             } => {
                 let case_insensitive = host_path_is_case_insensitive(&config.root_dir)?;
+                let upper_semantics = config.semantics;
                 let config = uncached_masked_passthrough_config(config);
                 let lower = PassthroughFs::new(config, inode_alloc.clone())?;
-                let inner = MaskFs::new(lower, mask, inode_alloc.clone(), case_insensitive)?;
+                let inner = MaskFs::new(
+                    lower,
+                    mask,
+                    upper_semantics,
+                    inode_alloc.clone(),
+                    case_insensitive,
+                )?;
                 FsServer::MaskedReadWrite(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
