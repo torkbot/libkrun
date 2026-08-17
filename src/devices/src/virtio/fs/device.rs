@@ -125,6 +125,12 @@ impl Fs {
             ..Default::default()
         };
 
+        #[cfg(target_os = "macos")]
+        let allow_idmap = matches!(
+            semantics,
+            PermissionSemantics::LinuxComplete | PermissionSemantics::Sandbox(_)
+        );
+        #[cfg(not(target_os = "macos"))]
         let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
 
         Self::from_backend(

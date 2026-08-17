@@ -4,6 +4,8 @@ use std::sync::Arc;
 use devices::virtio::fs::VirtualFsBackend;
 use devices::virtio::fs::mask_fs::MaskConfig;
 use devices::virtio::fs::virtual_entry::VirtualDirEntry;
+#[cfg(target_os = "macos")]
+use devices::virtio::passthrough::SandboxConfig;
 
 pub type FsPassthroughMaskConfig = MaskConfig;
 
@@ -14,6 +16,13 @@ pub struct FsDeviceConfig {
     pub shm_size: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FsPassthroughMode {
+    LinuxComplete,
+    #[cfg(target_os = "macos")]
+    Sandbox(SandboxConfig),
+}
+
 #[derive(Clone)]
 pub enum FsDeviceBackend {
     Passthrough {
@@ -21,6 +30,7 @@ pub enum FsDeviceBackend {
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
         mask: Option<MaskConfig>,
+        mode: FsPassthroughMode,
     },
     Null {
         virtual_entries: Vec<VirtualDirEntry>,
@@ -48,12 +58,14 @@ impl fmt::Debug for FsDeviceBackend {
                 read_only,
                 virtual_entries,
                 mask,
+                mode,
             } => f
                 .debug_struct("Passthrough")
                 .field("shared_dir", shared_dir)
                 .field("read_only", read_only)
                 .field("virtual_entries", virtual_entries)
                 .field("mask", mask)
+                .field("mode", mode)
                 .finish(),
             FsDeviceBackend::Null { virtual_entries } => f
                 .debug_struct("Null")

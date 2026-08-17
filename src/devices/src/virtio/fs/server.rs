@@ -912,10 +912,6 @@ impl<F: FileSystem + Sync> Server<F> {
             supported |= FsOptions::ALLOW_IDMAP;
         }
 
-        if cfg!(target_os = "macos") {
-            supported |= FsOptions::SECURITY_CTX;
-        }
-
         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
         let capable = FsOptions::from_bits_truncate(flags_64);
 
